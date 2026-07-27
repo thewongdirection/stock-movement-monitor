@@ -111,15 +111,21 @@ class FMPProvider:
         )
         return _parse_bars(payload)
 
-    def average_daily_volume(self, bars: list[Bar], sessions: int) -> float | None:
-        """ADV derived from the intraday bars we already hold — no extra call."""
+    def average_daily_volume(
+        self, bars: list[Bar], sessions: int, now: datetime | None = None
+    ) -> float | None:
+        """ADV derived from the intraday bars we already hold — no extra call.
+
+        `now` comes from the run rather than the wall clock so that "today" means
+        the same day the rest of the run is reasoning about.
+        """
         by_day: dict[date, int] = {}
         for bar in bars:
             by_day[bar.ts.date()] = by_day.get(bar.ts.date(), 0) + bar.volume
         if not by_day:
             return None
         # Drop today: a partial session would drag the average down.
-        today = datetime.now(ET).date()
+        today = (now.astimezone(ET) if now else datetime.now(ET)).date()
         complete = [v for d, v in sorted(by_day.items()) if d != today]
         if not complete:
             return None

@@ -133,16 +133,50 @@ class CommandRouter:
         )
 
     # -- watchlist --------------------------------------------------------
+    def _last_run(self, state: State) -> datetime | None:
+        row = state.db.execute(
+            "SELECT started_at FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            stamp = datetime.fromisoformat(str(row[0]))
+        except ValueError:
+            return None
+        return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def _last_run_from(row: tuple | None) -> datetime | None:
+        if not row:
+            return None
+        try:
+            stamp = datetime.fromisoformat(str(row[0]))
+        except ValueError:
+            return None
+        return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+    def _trading_now(self) -> bool:
+        from .. import market_calendar as cal
+
+        running, _ = cal.should_run(
+            self.ctx.now().astimezone(cal.ET),
+            extended_hours=bool(self.ctx.config.run["extended_hours"]),
+        )
+        return running
+
     def cmd_list(self, args: list[str]) -> Reply:
         cfg = self.ctx.config
         now = self.ctx.now()
         with State(self.ctx.state_path) as state:
             counts = state.signal_counts(now, days=14)
+            warning = _staleness_warning(self._last_run(state), now, self._trading_now())
 
         if not cfg.tickers:
             return Reply("The watchlist is empty. Add one with <code>/add NVDA</code>.")
 
         lines = ["<b>Watchlist</b> — signals in the last 14 days\n"]
+        if warning:
+            lines.append(warning + "\n")
         for ticker in cfg.tickers:
             count = counts.get(ticker, 0)
             marker = "•" if count == 0 else "▸"
@@ -199,11 +233,14 @@ class CommandRouter:
         now = self.ctx.now()
         with State(self.ctx.state_path) as state:
             signals = state.signals_for(ticker, now, days=days)
+            warning = _staleness_warning(self._last_run(state), now, self._trading_now())
 
         watched = ticker in self.ctx.config.tickers
         header = f"<b>{ticker}</b> — last {days} days"
         if not watched:
             header += "\n<i>Not currently on the watchlist.</i>"
+        if warning:
+            header += "\n\n" + warning
 
         if not signals:
             return Reply(
@@ -251,8 +288,12 @@ class CommandRouter:
     # -- CAN SLIM ---------------------------------------------------------
     def cmd_grade(self, args: list[str]) -> Reply:
         if not args:
-            return Reply("Usage: <code>/grade NVDA</code>")
+            return Reply("Usage: <code>/grade NVDA</code> · add <code>cached</code> to reuse today's")
         ticker = args[0].upper()
+        # Interactive means now. Someone who types /grade is asking about the
+        # market as it stands, so this re-fetches by default and the cached grade
+        # is the thing you have to ask for — not the other way round.
+        reuse = any(a.lower() in {"cached", "cache", "reuse"} for a in args[1:])
         service = self.ctx.canslim
         if service is None:
             return Reply(
@@ -263,10 +304,13 @@ class CommandRouter:
                 "vendor/can-slim-grader</code>"
             )
 
-        outcome = service.grade(ticker, self.ctx.now())
+        now = self.ctx.now()
+        outcome = service.grade(ticker, now, force=not reuse)
         if not outcome.ok:
             return Reply(
                 f"Could not grade <b>{ticker}</b>: {html.escape(outcome.skipped or 'unknown reason')}"
+                "\n\n<i>Nothing was graded — no stale figures are being shown "
+                "instead.</i>"
             )
 
         report = outcome.report
@@ -289,16 +333,39 @@ class CommandRouter:
                 f"\n<i>PDF unavailable ({html.escape(report.pdf_error[:120])}); "
                 "the HTML report is attached instead.</i>"
             )
-        lines.append(
-            "\n<i>Letters scored programmatically against the can-slim-grader "
-            "rubric. Decision support, not advice.</i>"
-        )
+
+        # Say where the letters came from — the two passes are not equivalent and
+        # the message must not imply otherwise, same as the PDF's disclaimer.
+        if grade.narrated:
+            lines.append(
+                "\n<i>Measurable letters scored programmatically; the commentary "
+                "and the judgement letters (N, I) were written by Claude and may "
+                "contain errors. Decision support, not advice.</i>"
+            )
+        else:
+            lines.append(
+                "\n<i>Letters scored programmatically against the can-slim-grader "
+                "rubric. Decision support, not advice.</i>"
+            )
+
+        # And how old the figures are. Silence here would read as "current".
+        age = report.age_minutes(now)
+        if report.from_cache and age is not None and age >= 1:
+            lines.append(
+                f"<i>♻️ Reused a grade from {_ago(age)} — figures are as of then. "
+                f"<code>/grade {ticker}</code> re-runs it.</i>"
+            )
+        else:
+            lines.append(f"<i>🕒 Graded just now, as of {html.escape(grade.as_of)}.</i>")
 
         files = [report.pdf_path] if report.has_pdf else [report.html_path]
-        return Reply("\n".join(lines), files=[f for f in files if f], buttons=[
+        buttons = [
             Button(f"History {ticker}", f"history {ticker}"),
             Button("Watchlist", "list"),
-        ])
+        ]
+        if report.from_cache:
+            buttons.insert(0, Button("Re-grade now", f"grade {ticker}"))
+        return Reply("\n".join(lines), files=[f for f in files if f], buttons=buttons)
 
     # -- levels & tuning --------------------------------------------------
     def cmd_levels(self, args: list[str]) -> Reply:
@@ -576,6 +643,20 @@ class CommandRouter:
         else:
             lines.append("Last run: <i>never (no runs recorded yet)</i>")
 
+        warning = _staleness_warning(self._last_run_from(last), now, running)
+        if warning:
+            lines.append("\n" + warning)
+
+        missing = _missing_credentials(cfg)
+        if missing:
+            lines.append("\n<b>🔑 Data sources that cannot be reached</b>")
+            for name, why in missing:
+                lines.append(f"• <code>{name}</code> is not set — {html.escape(why)}")
+            lines.append(
+                "<i>Those detectors will stay silent. Silence from them is not "
+                "an all-clear.</i>"
+            )
+
         if health:
             lines.append("\n<b>🩺 Data source problems</b>")
             for key, value in health:
@@ -632,6 +713,81 @@ HANDLERS = {
     "changes": "cmd_changes",
     "status": "cmd_status",
 }
+
+
+def _missing_credentials(cfg: Config) -> list[tuple[str, str]]:
+    """Credentials a currently-enabled detector needs but does not have.
+
+    A detector with no key does not fail loudly — it just never fires, which is
+    indistinguishable from a quiet market. Naming the gap in `/status` is the
+    only place the operator will see it.
+    """
+    import os
+
+    from ..providers.sec_edgar import is_placeholder_user_agent
+
+    wanted: list[tuple[str, str]] = []
+    if cfg.needs("bars"):
+        wanted.append(("FMP_API_KEY", "no intraday bars, so no volume anomalies"))
+    if cfg.needs("trades") or cfg.needs("flow"):
+        wanted.append(("UW_API_KEY", "no dark-pool prints or options flow"))
+    if cfg.canslim.get("narrator") == "llm":
+        wanted.append(("ANTHROPIC_API_KEY", "scorecards fall back to computed letters"))
+    missing = [(name, why) for name, why in wanted if not os.environ.get(name)]
+
+    ua = cfg.providers.sec_user_agent
+    if cfg.needs("insider") and (
+        not os.environ.get("SEC_USER_AGENT")
+        and (not ua or is_placeholder_user_agent(ua))
+    ):
+        missing.append(
+            ("SEC_USER_AGENT", "EDGAR needs a real contact address, so no Form 4 alerts")
+        )
+    return missing
+
+
+def _ago(minutes: float) -> str:
+    if minutes < 90:
+        return f"{minutes:.0f} min ago"
+    hours = minutes / 60
+    if hours < 36:
+        return f"{hours:.1f}h ago"
+    return f"{hours / 24:.1f} days ago"
+
+
+#: How far behind the cron may fall before the bot stops presenting its records
+#: as current. The cron ticks every 5 minutes and GitHub's scheduler is often
+#: 5-20 minutes late, so this has to tolerate ordinary lateness without going
+#: quiet about a cron that has actually stopped.
+STALE_RUN_MINUTES = 30
+
+
+def _staleness_warning(last_run: datetime | None, now: datetime, trading: bool) -> str | None:
+    """Warn when what the bot is about to show was written by a dead cron.
+
+    Everything in `/list`, `/history` and `/status` is a record of what the cron
+    saw. If the cron stopped an hour ago, an empty watchlist reads as "nothing is
+    happening" when it means "nobody is looking" — the exact failure this project
+    exists to avoid.
+    """
+    if last_run is None:
+        return (
+            "⚠️ <b>No run has ever been recorded.</b> These records are empty "
+            "because nothing has polled yet, not because the market is quiet. "
+            "Start the cron, or run <code>monitor run</code> once."
+        )
+    lag = (now - last_run).total_seconds() / 60.0
+    if lag <= STALE_RUN_MINUTES:
+        return None
+    tail = (
+        " The market is open, so this means alerts are being missed right now."
+        if trading
+        else ""
+    )
+    return (
+        f"⚠️ <b>Last poll was {_ago(lag)}</b> — the counts below stop there and "
+        f"may be out of date.{tail}"
+    )
 
 
 def _fmt(value: object) -> str:

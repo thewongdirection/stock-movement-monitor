@@ -75,6 +75,13 @@ class HealthReport:
 IMPLAUSIBLE_MOVE_PCT = 50.0
 
 
+#: Pre-market and after-hours bars are legitimately sparse — a thin name can go
+#: half an hour without a print — so the staleness budget is widened rather than
+#: skipped. Skipping it entirely (which is what this used to do) meant a feed
+#: that froze during extended hours was never caught at all.
+EXTENDED_BUDGET_MULTIPLIER = 6
+
+
 def inspect_bars(
     ticker: str,
     bars: list[Bar],
@@ -83,6 +90,7 @@ def inspect_bars(
     now: datetime,
     interval_minutes: int,
     max_stale_intervals: int = 4,
+    extended_hours: bool = False,
 ) -> tuple[list[Bar], list[Finding]]:
     """Validate a bar series, returning the usable bars plus any findings.
 
@@ -148,7 +156,13 @@ def inspect_bars(
         )
         return [], findings
 
-    stale = _staleness(clean[-1].ts, now, interval_minutes, max_stale_intervals)
+    stale = _staleness(
+        clean[-1].ts,
+        now,
+        interval_minutes,
+        max_stale_intervals,
+        extended_hours=extended_hours,
+    )
     if stale:
         findings.append(Finding(source, ticker, HealthState.STALE, stale))
 
@@ -156,28 +170,39 @@ def inspect_bars(
 
 
 def _staleness(
-    newest: datetime, now: datetime, interval_minutes: int, max_intervals: int
+    newest: datetime,
+    now: datetime,
+    interval_minutes: int,
+    max_intervals: int,
+    *,
+    extended_hours: bool = False,
 ) -> str | None:
     """Describe how far behind the newest bar is, or None if it's current.
 
-    Only meaningful during a session — outside one, the newest bar is *supposed*
-    to be the last close.
+    Only meaningful while trading — outside a session the newest bar is
+    *supposed* to be the last close, so there is nothing to complain about.
     """
     now_et = now.astimezone(cal.ET)
-    if not cal.is_regular_session(now_et):
-        return None
-    into = cal.minutes_into_session(now_et) or 0
-    # Right after the open there is legitimately little data yet.
-    if into < max(interval_minutes * 2, 10):
+    budget = interval_minutes * max_intervals
+    window = "session"
+
+    if cal.is_regular_session(now_et):
+        into = cal.minutes_into_session(now_et) or 0
+        # Right after the open there is legitimately little data yet.
+        if into < max(interval_minutes * 2, 10):
+            return None
+    elif extended_hours and cal.is_extended_session(now_et):
+        budget *= EXTENDED_BUDGET_MULTIPLIER
+        window = "extended-hours"
+    else:
         return None
 
     lag = (now_et - newest.astimezone(cal.ET)).total_seconds() / 60.0
-    budget = interval_minutes * max_intervals
     if lag <= budget:
         return None
     return (
         f"newest bar is {lag:.0f} min old ({newest.astimezone(cal.ET):%Y-%m-%d %H:%M %Z}); "
-        f"expected within {budget:.0f} min of now — the feed looks frozen"
+        f"expected within {budget:.0f} min of now ({window}) — the feed looks frozen"
     )
 
 
@@ -280,6 +305,71 @@ class HealthTracker:
                         ),
                     )
                 )
+
+    def record_feed_advance(
+        self,
+        source: str,
+        newest: datetime | None,
+        now: datetime,
+        *,
+        silence_minutes: int,
+        extended_hours: bool = False,
+    ) -> None:
+        """Catch an event feed that answers HTTP 200 with the same old data.
+
+        Bars have a timestamp per interval, so staleness is visible per ticker.
+        Print and flow feeds don't: a thin name legitimately has no dark-pool
+        prints for an hour, so per-ticker silence proves nothing. What does prove
+        something is the *whole watchlist* going quiet — if no ticker's newest
+        event has advanced since the last run, and the newest one we have is
+        older than the silence budget, the feed is frozen rather than the market.
+
+        `newest` is the maximum event timestamp across every ticker this run, or
+        None when the feed returned nothing at all.
+        """
+        now_et = now.astimezone(cal.ET)
+        trading = cal.is_regular_session(now_et) or (
+            extended_hours and cal.is_extended_session(now_et)
+        )
+        key = f"feed:{source}"
+        if not trading:
+            # Outside a session there is nothing to advance. Don't accumulate a
+            # count overnight that fires spuriously at the open.
+            self.state.reset_counter(f"{self._key(source, '*')}:{HealthState.STALE.value}")
+            if newest is not None:
+                self.state.set_feed_seen(key, newest)
+            return
+
+        previous = self.state.feed_seen(key)
+        advanced = newest is not None and (previous is None or newest > previous)
+        if advanced:
+            self.state.set_feed_seen(key, newest)  # type: ignore[arg-type]
+            self.record_success(source, "*")
+            self.clear_findings(source, "*")
+            return
+
+        high_water = newest or previous
+        if high_water is None:
+            # Never seen anything from this feed. Could be a brand-new watchlist,
+            # so this is not evidence of a fault on its own.
+            return
+
+        silent_for = (now_et - high_water.astimezone(cal.ET)).total_seconds() / 60.0
+        if silent_for <= silence_minutes:
+            return
+
+        self.record_findings(
+            [
+                Finding(
+                    source,
+                    "*",
+                    HealthState.STALE,
+                    f"no new events across the whole watchlist for {silent_for:.0f} min "
+                    f"(newest: {high_water.astimezone(cal.ET):%Y-%m-%d %H:%M %Z}, budget "
+                    f"{silence_minutes} min) — the feed is probably frozen, not the market",
+                )
+            ]
+        )
 
     def clear_findings(self, source: str, ticker: str) -> None:
         for state in (HealthState.STALE, HealthState.CORRUPT, HealthState.EMPTY):

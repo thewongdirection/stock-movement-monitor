@@ -176,22 +176,56 @@ class State:
             return
         self._pending_cooldowns[(detector, ticker)] = now + timedelta(minutes=minutes)
 
+    # -- feed freshness ---------------------------------------------------
+    def feed_seen(self, key: str) -> datetime | None:
+        """The newest event timestamp seen from a feed on any previous run."""
+        row = self.db.execute(
+            "SELECT value FROM watermarks WHERE key = ?", (key,)
+        ).fetchone()
+        return _parse(row[0]) if row else None
+
+    def set_feed_seen(self, key: str, moment: datetime) -> None:
+        """Written immediately, not staged.
+
+        Unlike a detector watermark this is not a claim about what was delivered
+        — it records what the provider showed us. Gating it on delivery success
+        would make a delivery outage look like a frozen feed.
+        """
+        self.db.execute(
+            "INSERT INTO watermarks (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, _iso(moment)),
+        )
+
     # -- insider cluster support -----------------------------------------
     def recent_insider_buyers(self, ticker: str, now: datetime, days: int) -> int:
         """Distinct insiders we've recorded buying this name inside the window."""
         cutoff = _iso(now - timedelta(days=days))
         cur = self.db.execute(
-            "SELECT COUNT(DISTINCT dedup_id) FROM seen "
+            "SELECT COUNT(*) FROM seen "
             "WHERE ticker = ? AND detector = ? AND created_at >= ?",
             (ticker, "insider_buy_party", cutoff),
         )
         return int(cur.fetchone()[0])
 
     def record_insider_buyer(self, ticker: str, insider: str, now: datetime) -> None:
+        """Record (or refresh) an insider's most recent buy in this name.
+
+        The date must be *updated*, not preserved: the key is per insider with no
+        date in it, so an INSERT OR IGNORE would pin the row to the first time
+        this person ever bought. An insider who bought a year ago and buys again
+        today would then still look a year old, and drop out of every cluster
+        window — the exact case the cluster signal exists to catch.
+        """
         import hashlib
 
         key = hashlib.sha1(f"{ticker}|{insider.lower()}".encode()).hexdigest()[:20]
-        self.mark_seen(key, "insider_buy_party", ticker, now)
+        self.db.execute(
+            "INSERT INTO seen (dedup_id, detector, ticker, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(dedup_id) DO UPDATE SET created_at = excluded.created_at",
+            (key, "insider_buy_party", ticker, _iso(now)),
+        )
 
     # -- health counters --------------------------------------------------
     def bump_counter(self, key: str) -> int:
@@ -274,9 +308,25 @@ class State:
             (_iso(started_at), alerts, note),
         )
 
-    def prune(self, now: datetime, retention_days: int) -> None:
+    def prune(self, now: datetime, retention_days: int, cluster_days: int = 0) -> None:
+        """Drop state past its usefulness — but never state something still needs.
+
+        `cluster_days` is the widest insider `cluster_window_days` in the config.
+        The buyer rows the cluster signal counts live in `seen`, so pruning that
+        table on `state_retention_days` alone would silently break cluster
+        detection whenever retention is the shorter of the two — and with both at
+        their defaults (30 and 30) they land exactly on the boundary.
+        """
         cutoff = _iso(now - timedelta(days=retention_days))
-        self.db.execute("DELETE FROM seen WHERE created_at < ?", (cutoff,))
+        self.db.execute(
+            "DELETE FROM seen WHERE created_at < ? AND detector != ?",
+            (cutoff, "insider_buy_party"),
+        )
+        buyer_cutoff = _iso(now - timedelta(days=max(retention_days, cluster_days) + 1))
+        self.db.execute(
+            "DELETE FROM seen WHERE created_at < ? AND detector = ?",
+            (buyer_cutoff, "insider_buy_party"),
+        )
         self.db.execute("DELETE FROM cooldowns WHERE until < ?", (_iso(now),))
         self.db.execute("DELETE FROM runs WHERE started_at < ?", (cutoff,))
         # Signal history is what the bot's /history command reads, so it is kept

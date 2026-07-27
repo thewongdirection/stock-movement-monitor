@@ -80,6 +80,11 @@ Or non-interactively: `monitor console --script "list; add PLTR; levels"`.
 
 ## Setup
 
+> **[SETUP.md](SETUP.md) is the step-by-step walkthrough** — nine numbered steps
+> from `git clone` to alerts on your phone, each with a command that checks it
+> worked. The reference below covers the same ground by topic; start there if you
+> would rather be told what to type next.
+
 ### 1. Telegram bot
 
 Message [@BotFather](https://t.me/botfather) → `/newbot` → copy the token.
@@ -272,12 +277,13 @@ anyone holding it could otherwise edit your watchlist.
 | `/list` | Watchlist with 14-day signal counts; tap a ticker for its history |
 | `/add NVDA` · `/remove NVDA` | Edit the watchlist |
 | `/history NVDA [days]` | Signals recorded for that name, newest first |
-| `/grade NVDA` | CAN SLIM scorecard, PDF attached |
+| `/grade NVDA` | CAN SLIM scorecard, PDF attached — re-graded fresh |
 | `/levels` · `/on X` · `/off X` | Which detection levels run |
 | `/config [X]` · `/set X SETTING VALUE` | Read and change thresholds |
 | `/set TSLA X SETTING VALUE` | Change one setting for one ticker |
 | `/explain X` | Every setting, its allowed range, and the reasoning |
 | `/narrator [SETTING VALUE]` | Who writes the CAN SLIM letters, and what that costs |
+| `/grade NVDA cached` | Reuse today's grade instead of re-running it |
 | `/reset [X]` · `/changes` | Back to committed defaults; see the live diff |
 | `/status` | Market state, data-source health, last run |
 
@@ -439,6 +445,13 @@ silence reads as "nothing is happening". Three distinct failures, three checks:
 | **Stale** | bar timestamps compared against the session clock | when the newest bar falls more than `max_stale_intervals` behind during a session |
 | **Corrupt** | negative volume, non-positive prices, high&nbsp;<&nbsp;low, OHLC out of range, out-of-order or duplicate timestamps, implausible intraday jumps | immediately |
 
+A fourth failure sits outside that table because it isn't about a provider at
+all: **the cron itself stopping.** Everything `/list`, `/history` and `/status`
+show is a record of what the cron saw, so if it died an hour ago an empty
+watchlist reads as "nothing is happening" when it means "nobody is looking". The
+bot refuses to present those records as current — it says how long ago the last
+poll was, and says outright that alerts are being missed if the market is open.
+
 Stale is the dangerous one: the call *succeeds*, so a frozen feed looks perfectly
 healthy from outside. Corrupt is escalated immediately rather than after N
 occurrences, because a corrupt bar produces a confident, completely false alert —
@@ -446,6 +459,32 @@ so corrupt bars are **dropped before any detector sees them**. An unadjusted
 10-for-1 split is caught this way instead of being reported as a -90% move.
 Recovery is announced too, so you know when to trust a feed again. `/status`
 shows current health; the run footer reports changes.
+
+### Nothing is served from cache without saying so
+
+A monitor that answers with old data is worse than one that admits it can't
+answer, so the rule is: fetch fresh, and where something is reused, stamp it.
+
+- **Every provider request forbids caching** (`Cache-Control: no-cache, no-store`,
+  `Pragma: no-cache`). `requests` keeps no cache of its own, but proxies and CDNs
+  in the path do, and any of them will happily serve a minute-old quote.
+- **A frozen event feed is caught by the watchlist going quiet, not one ticker.**
+  A thin name really can have no dark-pool prints for an hour, so per-ticker
+  silence proves nothing. If *no* ticker's newest print has advanced since the
+  last run and the newest one on file is older than
+  `run.max_feed_silence_minutes`, the feed is reported as frozen.
+- **Bar staleness is checked during extended hours too**, on a wider budget
+  (pre-market bars are legitimately sparse). It used to be skipped outside the
+  regular session, which meant a feed that froze at 07:00 was never caught.
+- **Scorecards expire.** A CAN SLIM verdict barely moves intraday, but the price
+  and pivot printed beside it do, so a cached grade older than
+  `run.canslim_max_age_minutes` (default 90) is re-graded rather than reused, and
+  a reused one says how old its figures are.
+- **`/grade` re-fetches by default.** Someone who types it is asking about now.
+  The cached grade is the thing you have to ask for — `/grade NVDA cached` — not
+  the other way round.
+- **A failed grade returns nothing, never stale figures.** Same for a failed
+  fetch: the detector stays silent and the run footer says why.
 
 ---
 

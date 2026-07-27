@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from conftest import make_config, make_context, make_insider_txn
+from conftest import NOW, make_config, make_context, make_insider_txn
 
 from monitor.detectors import InsiderTradeDetector
 from monitor.models import Severity
@@ -282,3 +282,74 @@ def test_dedup_id_separates_two_lines_of_one_filing(state):
     alerts = InsiderTradeDetector().run(ctx)
     assert len(alerts) == 2
     assert alerts[0].dedup_id != alerts[1].dedup_id
+
+
+# --------------------------------------------------------------------------
+# Cluster bookkeeping
+# --------------------------------------------------------------------------
+def test_a_repeat_buyer_refreshes_their_date(state):
+    """The bug this covers: the row was INSERT OR IGNORE, so the date never moved.
+
+    An insider who bought a year ago and buys again today would keep the year-old
+    timestamp and fall outside every cluster window — silently removing the
+    strongest insider signal there is.
+    """
+    long_ago = NOW - timedelta(days=200)
+    state.record_insider_buyer("TEST", "Jane Doe", long_ago)
+    assert state.recent_insider_buyers("TEST", NOW, days=30) == 0
+
+    state.record_insider_buyer("TEST", "Jane Doe", NOW)
+    assert state.recent_insider_buyers("TEST", NOW, days=30) == 1
+
+
+def test_the_same_buyer_is_never_counted_twice(state):
+    """One person buying three times is one insider, not a cluster of three."""
+    for _ in range(3):
+        state.record_insider_buyer("TEST", "Jane Doe", NOW)
+    assert state.recent_insider_buyers("TEST", NOW, days=30) == 1
+
+
+def test_buyer_names_are_matched_case_insensitively(state):
+    state.record_insider_buyer("TEST", "Jane Doe", NOW)
+    state.record_insider_buyer("TEST", "JANE DOE", NOW)
+    assert state.recent_insider_buyers("TEST", NOW, days=30) == 1
+
+
+def test_distinct_buyers_accumulate_into_a_cluster(state):
+    state.record_insider_buyer("TEST", "Jane Doe", NOW)
+    state.record_insider_buyer("TEST", "John Roe", NOW - timedelta(days=5))
+    assert state.recent_insider_buyers("TEST", NOW, days=30) == 2
+
+
+def test_buyers_in_another_ticker_are_not_counted(state):
+    state.record_insider_buyer("TEST", "Jane Doe", NOW)
+    state.record_insider_buyer("OTHER", "John Roe", NOW)
+    assert state.recent_insider_buyers("TEST", NOW, days=30) == 1
+
+
+def test_pruning_keeps_buyers_the_cluster_window_still_needs(state):
+    """`seen` is pruned on state_retention_days, but the cluster window can be longer.
+
+    With retention shorter than the window, buyer rows were deleted while the
+    detector was still supposed to be counting them.
+    """
+    recent = NOW - timedelta(days=20)
+    state.record_insider_buyer("TEST", "Jane Doe", recent)
+    state.prune(NOW, retention_days=7, cluster_days=30)
+    assert state.recent_insider_buyers("TEST", NOW, days=30) == 1
+
+
+def test_pruning_still_drops_buyers_past_every_window(state):
+    ancient = NOW - timedelta(days=120)
+    state.record_insider_buyer("TEST", "Jane Doe", ancient)
+    state.prune(NOW, retention_days=7, cluster_days=30)
+    assert state.recent_insider_buyers("TEST", NOW, days=180) == 0
+
+
+def test_pruning_still_clears_ordinary_dedup_keys(state):
+    """The carve-out is only for buyer rows; normal dedup keys expire as before."""
+    state.mark_seen("old-key", "dark_pool", "TEST", NOW - timedelta(days=40))
+    state.record_insider_buyer("TEST", "Jane Doe", NOW - timedelta(days=40))
+    state.prune(NOW, retention_days=7, cluster_days=90)
+    assert state.is_new("old-key")
+    assert state.recent_insider_buyers("TEST", NOW, days=90) == 1

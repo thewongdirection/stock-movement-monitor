@@ -13,6 +13,16 @@ log = logging.getLogger(__name__)
 
 RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 
+#: Sent on every provider request. A monitor exists to see what is happening
+#: *now*, so a cached response is not a cheap win — it is a wrong answer that
+#: looks like a right one. `requests` keeps no cache of its own, but corporate
+#: proxies, CDNs in front of the APIs, and the agent proxy this runs behind all
+#: do, and any of them will happily serve a minute-old quote.
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, max-age=0",
+    "Pragma": "no-cache",
+}
+
 
 class ProviderError(RuntimeError):
     """A provider call failed in a way the caller should surface, not swallow."""
@@ -47,6 +57,7 @@ class RateLimitedSession:
         max_attempts: int = 4,
     ):
         self.session = requests.Session()
+        self.session.headers.update(NO_CACHE_HEADERS)
         if headers:
             self.session.headers.update(headers)
         self.min_interval = min_interval

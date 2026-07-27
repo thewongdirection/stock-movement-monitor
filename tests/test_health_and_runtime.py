@@ -118,7 +118,7 @@ class FlakyBars:
             raise ProviderError("HTTP 503: upstream unavailable")
         return self._bars
 
-    def average_daily_volume(self, bars, sessions):
+    def average_daily_volume(self, bars, sessions, now=None):
         return 55_000_000
 
     def close(self):
@@ -407,3 +407,143 @@ def test_reset_all_also_drops_the_narrator_change(overlay):
 def test_describe_reports_the_narrator_change(overlay):
     overlay.set_canslim("narrator", "llm")
     assert "canslim.narrator = llm" in overlay.describe()
+
+
+# --------------------------------------------------------------------------
+# Freshness: never serve old data quietly
+# --------------------------------------------------------------------------
+def test_every_provider_request_forbids_a_cached_response():
+    """A cached quote is not a cheap win — it is a wrong answer that looks right."""
+    from monitor.providers.base import RateLimitedSession
+
+    session = RateLimitedSession()
+    try:
+        assert "no-store" in session.session.headers["Cache-Control"]
+        assert session.session.headers["Pragma"] == "no-cache"
+    finally:
+        session.close()
+
+
+def test_provider_headers_do_not_clobber_the_no_cache_headers():
+    from monitor.providers.base import RateLimitedSession
+
+    session = RateLimitedSession(headers={"User-Agent": "monitor test"})
+    try:
+        assert session.session.headers["User-Agent"] == "monitor test"
+        assert "no-cache" in session.session.headers["Cache-Control"]
+    finally:
+        session.close()
+
+
+def test_a_frozen_feed_during_extended_hours_is_still_caught():
+    """This used to be skipped entirely — extended hours had no staleness check."""
+    from monitor.health import inspect_bars
+
+    premarket = datetime(2026, 7, 27, 8, 30, tzinfo=ET)
+    old = premarket - timedelta(hours=3)
+    bars = [Bar(ts=old, open=100, high=100.5, low=99.5, close=100, volume=1_000)]
+
+    _, findings = inspect_bars(
+        "TEST", bars, now=premarket, interval_minutes=5, extended_hours=True
+    )
+    assert [f.state for f in findings] == [HealthState.STALE]
+    assert "extended-hours" in findings[0].detail
+
+
+def test_extended_hours_tolerates_ordinary_sparseness():
+    """Pre-market bars are legitimately thin; the budget widens rather than vanishing."""
+    from monitor.health import inspect_bars
+
+    premarket = datetime(2026, 7, 27, 8, 30, tzinfo=ET)
+    recent = premarket - timedelta(minutes=20)
+    bars = [Bar(ts=recent, open=100, high=100.5, low=99.5, close=100, volume=1_000)]
+
+    _, findings = inspect_bars(
+        "TEST", bars, now=premarket, interval_minutes=5, extended_hours=True
+    )
+    assert findings == []
+
+
+def test_extended_hours_staleness_is_not_checked_when_not_polling_then():
+    """With extended_hours off the monitor isn't looking, so silence is expected."""
+    from monitor.health import inspect_bars
+
+    premarket = datetime(2026, 7, 27, 8, 30, tzinfo=ET)
+    old = premarket - timedelta(hours=5)
+    bars = [Bar(ts=old, open=100, high=100.5, low=99.5, close=100, volume=1_000)]
+
+    _, findings = inspect_bars(
+        "TEST", bars, now=premarket, interval_minutes=5, extended_hours=False
+    )
+    assert findings == []
+
+
+# --------------------------------------------------------------------------
+# Frozen event feeds — HTTP 200 with yesterday's data
+# --------------------------------------------------------------------------
+SESSION = datetime(2026, 7, 27, 14, 30, tzinfo=ET)
+
+
+def test_a_feed_that_stops_advancing_is_reported(state):
+    """The dangerous case: the call succeeds and returns the same prints forever."""
+    tracker = HealthTracker(state, unresponsive_after=1)
+    frozen_at = SESSION - timedelta(minutes=200)
+
+    tracker.record_feed_advance(
+        "prints", frozen_at, SESSION - timedelta(minutes=10), silence_minutes=60
+    )
+    tracker.record_feed_advance("prints", frozen_at, SESSION, silence_minutes=60)
+
+    stale = [f for f in tracker.report.findings if f.state is HealthState.STALE]
+    assert stale, "a feed stuck for 200 minutes should be reported"
+    assert "frozen, not the market" in stale[0].detail
+    assert "🧊" in tracker.summary_message()
+
+
+def test_a_feed_that_keeps_advancing_is_quiet(state):
+    tracker = HealthTracker(state, unresponsive_after=1)
+    tracker.record_feed_advance(
+        "prints", SESSION - timedelta(minutes=40), SESSION - timedelta(minutes=30),
+        silence_minutes=60,
+    )
+    tracker.record_feed_advance(
+        "prints", SESSION - timedelta(minutes=2), SESSION, silence_minutes=60
+    )
+    assert tracker.summary_message() == ""
+
+
+def test_a_quiet_but_recent_feed_is_within_budget(state):
+    """A thin watchlist really can have no prints for a few minutes."""
+    tracker = HealthTracker(state, unresponsive_after=1)
+    newest = SESSION - timedelta(minutes=20)
+    tracker.record_feed_advance("prints", newest, SESSION - timedelta(minutes=5),
+                                silence_minutes=60)
+    tracker.record_feed_advance("prints", newest, SESSION, silence_minutes=60)
+    assert tracker.summary_message() == ""
+
+
+def test_a_feed_is_not_judged_outside_a_session(state):
+    """Nothing advances overnight; a count accumulated then would fire at the open."""
+    tracker = HealthTracker(state, unresponsive_after=1)
+    overnight = datetime(2026, 7, 27, 3, 0, tzinfo=ET)
+    tracker.record_feed_advance(
+        "prints", overnight - timedelta(hours=12), overnight, silence_minutes=60
+    )
+    assert tracker.summary_message() == ""
+
+
+def test_a_feed_never_seen_is_not_called_frozen(state):
+    """A brand-new watchlist has no history — that is not evidence of a fault."""
+    tracker = HealthTracker(state, unresponsive_after=1)
+    tracker.record_feed_advance("prints", None, SESSION, silence_minutes=60)
+    assert tracker.summary_message() == ""
+
+
+def test_feed_freshness_survives_between_runs(state):
+    """The comparison is across cron ticks, so it has to be persisted."""
+    tracker = HealthTracker(state, unresponsive_after=1)
+    newest = SESSION - timedelta(minutes=5)
+    tracker.record_feed_advance("prints", newest, SESSION, silence_minutes=60)
+
+    later = HealthTracker(state, unresponsive_after=1)
+    assert later.state.feed_seen("feed:prints") == newest

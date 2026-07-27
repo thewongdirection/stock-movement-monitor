@@ -11,6 +11,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from .grader import Grade
@@ -49,10 +50,19 @@ class Report:
     html_path: Path
     pdf_path: Path | None
     pdf_error: str | None = None
+    #: When the underlying grade was computed, so a reader can judge its age.
+    graded_at: datetime | None = None
+    #: True when this came back from the daily cache rather than a fresh grade.
+    from_cache: bool = False
 
     @property
     def has_pdf(self) -> bool:
         return self.pdf_path is not None and self.pdf_path.exists()
+
+    def age_minutes(self, now: datetime) -> float | None:
+        if self.graded_at is None:
+            return None
+        return max(0.0, (now - self.graded_at).total_seconds() / 60.0)
 
 
 def build_report(

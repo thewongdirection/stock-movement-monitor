@@ -116,14 +116,18 @@ run:
   min_severity: low               # low | medium | high
   state_retention_days: 30
 
-  # Data source health
+  # Data source health. A feed that stops working while still answering HTTP 200
+  # is the failure this project cares most about — silence reads as "nothing is
+  # happening" when it means "nobody is looking".
   unresponsive_after: 3           # consecutive failures before reporting an outage
   max_stale_intervals: 4          # bar intervals behind before the feed is "frozen"
+  max_feed_silence_minutes: 60    # no new prints/flow across the WHOLE watchlist
 
-  # CAN SLIM scorecards attached to alerts. Graded once per ticker per day and
-  # reused, so a busy name costs one grade rather than one per alert.
+  # CAN SLIM scorecards attached to alerts. Graded once per ticker and reused
+  # while still fresh, so a busy name costs one grade rather than one per alert.
   attach_canslim: true
   canslim_min_severity: medium    # don't grade every low-severity alert
+  canslim_max_age_minutes: 90     # re-grade rather than quote a stale price
 
 # ---------------------------------------------------------------------------
 # CAN SLIM grading

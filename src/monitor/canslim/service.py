@@ -87,16 +87,32 @@ class CanSlimService:
         return self._skill_error
 
     # -- grading ----------------------------------------------------------
-    def grade(self, ticker: str, now: datetime | None = None) -> GradeOutcome:
+    def grade(
+        self,
+        ticker: str,
+        now: datetime | None = None,
+        *,
+        max_age_minutes: int | None = None,
+        force: bool = False,
+    ) -> GradeOutcome:
+        """Grade a ticker, reusing a recent grade unless it is too old to trust.
+
+        `force` skips the cache entirely — that is what an interactive `/grade`
+        wants, because someone who just asked is asking about now. The cron
+        passes `max_age_minutes` instead: a verdict barely moves intraday, but
+        the price and pivot printed beside it do, so a grade has a shelf life
+        rather than lasting all day.
+        """
         ticker = ticker.upper()
         now = now or datetime.now()
         skill = self.skill()
         if skill is None:
             return GradeOutcome(ticker, skipped=self._skill_error or "skill unavailable")
 
-        cached = self._from_cache(ticker, now)
-        if cached is not None:
-            return GradeOutcome(ticker, report=cached)
+        if not force:
+            cached = self._from_cache(ticker, now, max_age_minutes=max_age_minutes)
+            if cached is not None:
+                return GradeOutcome(ticker, report=cached)
 
         if self._bars is None:
             return GradeOutcome(
@@ -149,6 +165,7 @@ class CanSlimService:
         report = build_report(
             grade, skill, self._report_dir(ticker, now), want_pdf=self.want_pdf
         )
+        report.graded_at = now
         self._to_cache(ticker, now, report)
         return GradeOutcome(ticker, report=report)
 
@@ -174,7 +191,9 @@ class CanSlimService:
     def _cache_file(self, ticker: str, now: datetime) -> Path:
         return self._report_dir(ticker, now) / f"{ticker}.json"
 
-    def _from_cache(self, ticker: str, now: datetime) -> Report | None:
+    def _from_cache(
+        self, ticker: str, now: datetime, *, max_age_minutes: int | None = None
+    ) -> Report | None:
         path = self._cache_file(ticker, now)
         if not path.exists():
             return None
@@ -182,6 +201,19 @@ class CanSlimService:
             payload = json.loads(path.read_text())
         except json.JSONDecodeError:
             return None
+        graded_at = _read_time(payload.get("graded_at"))
+        if max_age_minutes is not None:
+            if graded_at is None:
+                return None  # pre-dates the stamp; treat as too old to trust
+            age = (now - graded_at).total_seconds() / 60.0
+            if age < 0 or age > max_age_minutes:
+                log.info(
+                    "%s grade is %.0f min old (limit %d) — re-grading",
+                    ticker,
+                    age,
+                    max_age_minutes,
+                )
+                return None
         html = Path(payload.get("html", ""))
         if not html.exists():
             return None
@@ -195,6 +227,8 @@ class CanSlimService:
             html_path=html,
             pdf_path=pdf,
             pdf_error=payload.get("pdf_error"),
+            graded_at=graded_at,
+            from_cache=True,
         )
 
     def _to_cache(self, ticker: str, now: datetime, report: Report) -> None:
@@ -206,6 +240,7 @@ class CanSlimService:
                     "html": str(report.html_path),
                     "pdf": str(report.pdf_path) if report.pdf_path else None,
                     "pdf_error": report.pdf_error,
+                    "graded_at": now.isoformat(),
                     "summary": {
                         "verdict": report.grade.verdict,
                         "tone": report.grade.tone,
@@ -233,6 +268,15 @@ class CanSlimService:
         if self._bars is not None:
             self._bars.close()
         self._fundamentals.close()
+
+
+def _read_time(text: object) -> datetime | None:
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def _thin_grade(ticker: str, summary: dict) -> Grade:

@@ -175,14 +175,16 @@ class IBKRProvider:
         )
         return parse_history(payload, self.volume_multiplier)
 
-    def average_daily_volume(self, bars: list[Bar], sessions: int) -> float | None:
+    def average_daily_volume(
+        self, bars: list[Bar], sessions: int, now: datetime | None = None
+    ) -> float | None:
         """Prefer IBKR's own 90-day average; fall back to summing bars."""
         by_day: dict[Any, int] = {}
         for bar in bars:
             by_day[bar.ts.date()] = by_day.get(bar.ts.date(), 0) + bar.volume
         if not by_day:
             return None
-        today = datetime.now(ET).date()
+        today = (now.astimezone(ET) if now else datetime.now(ET)).date()
         complete = [v for d, v in sorted(by_day.items()) if d != today]
         if not complete:
             return None

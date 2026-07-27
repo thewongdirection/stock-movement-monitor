@@ -449,3 +449,184 @@ def test_reset_puts_the_narrator_back(router):
 
 def test_help_mentions_the_narrator(router):
     assert "/narrator" in router.handle("/help").text
+
+
+# --------------------------------------------------------------------------
+# Freshness warnings — the bot reads records a separate cron writes
+# --------------------------------------------------------------------------
+def _record_run(router, when):
+    with State(router.ctx.state_path) as state:
+        state.record_run(when, 0, "ok")
+        state.commit()
+
+
+def test_no_run_yet_is_called_out_not_shown_as_quiet(router):
+    """An empty watchlist means "nobody is looking", not "nothing is happening"."""
+    for command in ("/list", "/history NVDA", "/status"):
+        text = plain(router.handle(command).text)
+        assert "No run has ever been recorded" in text, command
+
+
+def test_a_stale_cron_is_flagged_on_every_view(router):
+    _record_run(router, NOW - timedelta(hours=3))
+    for command in ("/list", "/history NVDA", "/status"):
+        text = plain(router.handle(command).text)
+        assert "Last poll was" in text, command
+        assert "may be out of date" in text, command
+
+
+def test_a_recent_run_shows_no_warning(router):
+    _record_run(router, NOW - timedelta(minutes=6))
+    text = plain(router.handle("/list").text)
+    assert "Last poll was" not in text
+    assert "No run has ever" not in text
+
+
+def test_a_stale_cron_during_the_session_says_alerts_are_being_missed(tmp_path):
+    """The warning is sharper when the market is actually open."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(BASE_CONFIG)
+    overlay = Overlay(path=tmp_path / "runtime.json")
+    open_now = datetime(2026, 7, 27, 18, 0, tzinfo=timezone.utc)  # 14:00 ET, Monday
+    ctx = BotContext(
+        config_path=config_path,
+        state_path=tmp_path / "monitor.db",
+        overlay=overlay,
+        config=config_mod.load(config_path, overlay=overlay),
+        canslim=None,
+        now=lambda: open_now,
+    )
+    router = CommandRouter(ctx)
+    with State(ctx.state_path) as state:
+        state.record_run(open_now - timedelta(hours=2), 0, "ok")
+        state.commit()
+
+    text = plain(router.handle("/status").text)
+    assert "alerts are being missed right now" in text
+
+
+def test_status_names_the_credentials_it_is_missing(router, monkeypatch):
+    """A keyless detector never fires, which looks exactly like a quiet market."""
+    for name in ("FMP_API_KEY", "UW_API_KEY", "SEC_USER_AGENT"):
+        monkeypatch.delenv(name, raising=False)
+    text = plain(router.handle("/status").text)
+    assert "Data sources that cannot be reached" in text
+    assert "FMP_API_KEY" in text
+    assert "Silence from them is not an all-clear" in text
+
+
+def test_status_stops_naming_a_credential_once_it_is_set(router, monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "test-key")
+    monkeypatch.delenv("UW_API_KEY", raising=False)
+    text = plain(router.handle("/status").text)
+    assert "FMP_API_KEY" not in text
+    assert "UW_API_KEY" in text
+
+
+def test_status_asks_for_the_anthropic_key_only_when_the_narrator_is_on(router, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert "ANTHROPIC_API_KEY" not in plain(router.handle("/status").text)
+    router.handle("/narrator llm")
+    assert "ANTHROPIC_API_KEY" in plain(router.handle("/status").text)
+
+
+# --------------------------------------------------------------------------
+# /grade freshness and provenance
+# --------------------------------------------------------------------------
+class StubGradeService:
+    """Records how it was called and returns a report we control."""
+
+    def __init__(self, report, skipped=None):
+        self.report = report
+        self.skipped = skipped
+        self.calls: list[dict] = []
+        self.unavailable_reason = None
+
+    def grade(self, ticker, now=None, *, max_age_minutes=None, force=False):
+        from monitor.canslim.service import GradeOutcome
+
+        self.calls.append({"ticker": ticker, "force": force, "max_age": max_age_minutes})
+        if self.skipped:
+            return GradeOutcome(ticker, skipped=self.skipped)
+        return GradeOutcome(ticker, report=self.report)
+
+
+def _report(tmp_path, *, narrated=False, graded_at=None, from_cache=False):
+    from monitor.canslim.grader import Grade, LetterScore
+    from monitor.canslim.report import Report
+
+    html = tmp_path / "NVDA-canslim.html"
+    html.write_text("<html></html>")
+    grade = Grade(
+        ticker="NVDA",
+        company="Nvidia",
+        as_of="2026-07-27 14:00 ET",
+        price=100.0,
+        letters=[
+            LetterScore(key=k, score="pass", threshold="", actual="", read="")
+            for k in ("C", "A", "N", "S", "L", "I", "M")
+        ],
+        verdict="BUY-RANGE",
+        tone="up",
+        summary="Passes every letter.",
+        narrated=narrated,
+    )
+    return Report(
+        grade=grade,
+        html_path=html,
+        pdf_path=None,
+        graded_at=graded_at,
+        from_cache=from_cache,
+    )
+
+
+def _grade_router(router, service):
+    router.ctx.canslim = service
+    return router
+
+
+def test_grade_refetches_by_default(router, tmp_path):
+    """Someone who types /grade is asking about now, not about this morning."""
+    service = StubGradeService(_report(tmp_path))
+    _grade_router(router, service)
+    reply = router.handle("/grade NVDA")
+    assert service.calls[0]["force"] is True
+    assert "Graded just now" in plain(reply.text)
+
+
+def test_grade_can_be_asked_for_the_cached_one(router, tmp_path):
+    service = StubGradeService(
+        _report(tmp_path, graded_at=NOW - timedelta(minutes=45), from_cache=True)
+    )
+    _grade_router(router, service)
+    reply = router.handle("/grade NVDA cached")
+    assert service.calls[0]["force"] is False
+    text = plain(reply.text)
+    assert "Reused a grade from 45 min ago" in text
+    assert "figures are as of then" in text
+    assert any(b.command == "grade NVDA" for b in reply.buttons)
+
+
+def test_grade_says_when_claude_wrote_the_letters(router, tmp_path):
+    """The PDF got this right; the chat message used to claim it was computed."""
+    service = StubGradeService(_report(tmp_path, narrated=True))
+    _grade_router(router, service)
+    text = plain(router.handle("/grade NVDA").text)
+    assert "written by Claude" in text
+    assert "may contain errors" in text
+
+
+def test_grade_says_when_the_rubric_wrote_the_letters(router, tmp_path):
+    service = StubGradeService(_report(tmp_path, narrated=False))
+    _grade_router(router, service)
+    text = plain(router.handle("/grade NVDA").text)
+    assert "scored programmatically" in text
+    assert "written by Claude" not in text
+
+
+def test_a_failed_grade_does_not_fall_back_to_stale_figures(router, tmp_path):
+    service = StubGradeService(None, skipped="price history unavailable (HTTP 429)")
+    _grade_router(router, service)
+    text = plain(router.handle("/grade NVDA").text)
+    assert "price history unavailable" in text
+    assert "no stale figures are being shown" in text

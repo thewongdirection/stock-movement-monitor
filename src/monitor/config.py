@@ -456,6 +456,16 @@ RUN_SPECS = {
         "session before the feed is called stale. A frozen feed looks healthy "
         "from the outside, so this is the check that catches it.",
     ),
+    "max_feed_silence_minutes": Param(
+        60,
+        lo=10,
+        hi=480,
+        kind="int",
+        doc="How long the print and flow feeds may go without a single new event "
+        "across the whole watchlist before they are called frozen. Per-ticker "
+        "silence proves nothing — a thin name really can have no dark-pool prints "
+        "for an hour — but every ticker at once means the feed, not the market.",
+    ),
     "attach_canslim": Param(
         True,
         kind="bool",
@@ -468,6 +478,16 @@ RUN_SPECS = {
         kind="str",
         doc="Only attach a scorecard to alerts at or above this severity — "
         "grading every low-severity alert is rarely worth the calls.",
+    ),
+    "canslim_max_age_minutes": Param(
+        90,
+        lo=0,
+        hi=1440,
+        kind="int",
+        doc="How old an attached scorecard may be before it is re-graded. A "
+        "verdict turns on quarterly earnings so it barely moves intraday, but the "
+        "price and pivot on it do — a morning grade stapled to an afternoon alert "
+        "quotes a stale price. 0 re-grades on every alert (expensive).",
     ),
 }
 

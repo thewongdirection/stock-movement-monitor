@@ -235,24 +235,52 @@ def run(
     owned = providers is None
     providers = providers or Providers(config)
     candidates: list[Alert] = []
+    # Newest event timestamp per feed across the whole watchlist. One thin ticker
+    # going quiet proves nothing; all of them going quiet means a frozen feed.
+    feed_newest: dict[str, datetime | None] = {}
     try:
         for ticker in config.tickers:
             candidates.extend(
                 _process_ticker(
-                    config, state, providers, health, ticker, active, now, result
+                    config, state, providers, health, ticker, active, now, result,
+                    feed_newest,
                 )
             )
     finally:
         if owned:
             providers.close()
 
+    extended = bool(config.run["extended_hours"])
+    for source, newest in feed_newest.items():
+        health.record_feed_advance(
+            source,
+            newest,
+            now,
+            silence_minutes=int(config.run["max_feed_silence_minutes"]),
+            extended_hours=extended,
+        )
+
     result.health_summary = health.summary_message()
     _deliver(config, state, notifier, candidates, result, now, canslim)
 
-    state.prune(now, int(config.run["state_retention_days"]))
+    state.prune(
+        now,
+        int(config.run["state_retention_days"]),
+        cluster_days=_widest_cluster_window(config),
+    )
     state.record_run(now, len(result.delivered), result.summary())
     state.commit()
     return result
+
+
+def _widest_cluster_window(config: Config) -> int:
+    """The largest cluster window any ticker uses — per-ticker overrides included."""
+    windows = [int(config.detector("insider_trades").get("cluster_window_days", 0))]
+    windows.extend(
+        int(config.detector("insider_trades", ticker).get("cluster_window_days", 0))
+        for ticker in config.tickers
+    )
+    return max(windows, default=0)
 
 
 def _process_ticker(
@@ -264,6 +292,7 @@ def _process_ticker(
     active: list[str],
     now: datetime,
     result: RunResult,
+    feed_newest: dict[str, datetime | None] | None = None,
 ) -> list[Alert]:
     ctx = Context(
         ticker=ticker,
@@ -272,6 +301,8 @@ def _process_ticker(
         state=state,
         cold_start_minutes=int(config.run["cold_start_lookback_minutes"]),
     )
+
+    feeds = feed_newest if feed_newest is not None else {}
 
     def fetch(label: str, action):
         """Run a provider call, turning failure into a health record."""
@@ -287,6 +318,14 @@ def _process_ticker(
             return None
         health.record_success(label, ticker)
         return value
+
+    def note_freshness(source: str, timestamps: list[datetime]) -> None:
+        """Track the newest event this feed has shown us, across all tickers."""
+        current = feeds.get(source)
+        newest = max(timestamps, default=None)
+        if newest is not None and (current is None or newest > current):
+            feeds[source] = newest
+        feeds.setdefault(source, current)
 
     needs_bars = "volume_anomaly" in active
     wants_adv = any(
@@ -307,6 +346,7 @@ def _process_ticker(
                 now=now,
                 interval_minutes=int(INTERVAL_MINUTES.get(interval, 5)),
                 max_stale_intervals=int(config.run["max_stale_intervals"]),
+                extended_hours=bool(config.run["extended_hours"]),
             )
             if findings:
                 health.record_findings(findings)
@@ -315,7 +355,7 @@ def _process_ticker(
             else:
                 health.clear_findings("bars", ticker)
             ctx.bars = clean
-            ctx.adv = providers.bars.average_daily_volume(clean, sessions)
+            ctx.adv = providers.bars.average_daily_volume(clean, sessions, now=now)
 
     if {"block_trades", "dark_pool"} & set(active):
         prints = fetch("prints", lambda: providers.uw.dark_pool_prints(ticker))
@@ -331,6 +371,7 @@ def _process_ticker(
             else:
                 health.clear_findings("prints", ticker)
             ctx.prints = prints
+            note_freshness("prints", [p.ts for p in prints])
 
     if "options_flow" in active:
         flow = fetch("options flow", lambda: providers.uw.flow_alerts(ticker))
@@ -342,6 +383,7 @@ def _process_ticker(
             else:
                 health.clear_findings("options flow", ticker)
             ctx.option_trades = flow
+            note_freshness("options flow", [f.ts for f in flow])
 
     if "option_volume" in active:
         snapshot = fetch(
@@ -455,11 +497,13 @@ def _deliver(
     grade_floor = Severity(str(config.run["canslim_min_severity"])).rank
     want_grades = bool(config.run["attach_canslim"]) and canslim is not None
 
+    max_age = int(config.run["canslim_max_age_minutes"])
+
     failed_pairs: set[tuple[str, str]] = set()
     for alert in fresh:
         files: list[Path] = []
         if want_grades and alert.severity.rank >= grade_floor:
-            files = _grade_files(canslim, alert, result, now)
+            files = _grade_files(canslim, alert, result, now, max_age)
 
         if notifier.send(alert, files=files):
             state.mark_seen(alert.dedup_id, alert.detector, alert.ticker, now)
@@ -487,14 +531,16 @@ def _deliver(
         notifier.send_summary(footer)
 
 
-def _grade_files(canslim, alert: Alert, result: RunResult, now: datetime) -> list[Path]:
+def _grade_files(
+    canslim, alert: Alert, result: RunResult, now: datetime, max_age_minutes: int
+) -> list[Path]:
     """Grade the ticker and return the attachment, or nothing if it can't be done.
 
     A missing report must never cost the alert it was going to be attached to,
     so every failure here is recorded as a note and the alert goes out bare.
     """
     try:
-        outcome = canslim.grade(alert.ticker, now)
+        outcome = canslim.grade(alert.ticker, now, max_age_minutes=max_age_minutes)
     except Exception as exc:  # noqa: BLE001 - grading is a nicety, not the point
         log.warning("CAN SLIM grading failed for %s: %s", alert.ticker, exc)
         result.note(f"{alert.ticker}: CAN SLIM grading failed ({exc})")
@@ -505,17 +551,24 @@ def _grade_files(canslim, alert: Alert, result: RunResult, now: datetime) -> lis
         return []
 
     report = outcome.report
+    # Say how old the figures are rather than implying they are current. A grade
+    # reused from earlier in the session quotes the price it was computed at.
+    age = report.age_minutes(now)
+    stamp = ""
+    if report.from_cache and age is not None and age >= 1:
+        stamp = f" <i>(figures as of {age:.0f} min ago)</i>"
+
     if alert.ticker not in result.graded:
         result.graded.append(alert.ticker)
         alert.lines.append(
             f"\n📄 <b>CAN SLIM: {html.escape(report.grade.verdict)}</b> "
             f"({html.escape(report.grade.score_text)}) — "
-            f"{html.escape(report.grade.summary[:180])}"
+            f"{html.escape(report.grade.summary[:180])}{stamp}"
         )
     else:
         alert.lines.append(
-            f"\n📄 CAN SLIM: {html.escape(report.grade.one_line())} "
-            "<i>(graded earlier today)</i>"
+            f"\n📄 CAN SLIM: {html.escape(report.grade.one_line())}"
+            + (stamp or " <i>(graded earlier this run)</i>")
         )
 
     if report.has_pdf and report.pdf_path:

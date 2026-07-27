@@ -1117,3 +1117,80 @@ def test_a_computed_grade_stays_computed_through_the_cache(tmp_path):
     restored = service._from_cache("LEAD", now)
     assert restored.grade.narrated is False
     assert restored.grade.narrator_notes == []
+
+
+# --------------------------------------------------------------------------
+# Grade freshness
+# --------------------------------------------------------------------------
+def _service_with_cached_grade(tmp_path, graded_at):
+    """A service whose cache holds one grade, stamped at `graded_at`."""
+    from monitor.canslim.report import Report
+    from monitor.canslim.service import CanSlimService
+
+    html = tmp_path / "LEAD-canslim.html"
+    html.write_text("<html></html>")
+    service = CanSlimService(fmp_api_key="", fmp_base_url="", cache_dir=tmp_path / "cache")
+    service._to_cache(
+        "LEAD", graded_at, Report(grade=make_grade(), html_path=html, pdf_path=None)
+    )
+    return service
+
+
+def test_a_recent_grade_is_reused(tmp_path):
+    from datetime import datetime, timedelta
+
+    now = datetime(2026, 7, 27, 15, 0)
+    service = _service_with_cached_grade(tmp_path, now - timedelta(minutes=20))
+    report = service._from_cache("LEAD", now, max_age_minutes=90)
+    assert report is not None
+    assert report.from_cache is True
+    assert report.age_minutes(now) == pytest.approx(20, abs=0.1)
+
+
+def test_a_grade_past_its_age_limit_is_not_reused(tmp_path):
+    """A morning grade stapled to an afternoon alert quotes a stale price."""
+    from datetime import datetime, timedelta
+
+    now = datetime(2026, 7, 27, 15, 0)
+    service = _service_with_cached_grade(tmp_path, now - timedelta(minutes=300))
+    assert service._from_cache("LEAD", now, max_age_minutes=90) is None
+    # Still available when the caller doesn't care about age.
+    assert service._from_cache("LEAD", now) is not None
+
+
+def test_a_grade_with_no_timestamp_is_treated_as_too_old(tmp_path):
+    """Cache written by an older build. Unknown age is not the same as fresh."""
+    import json
+    from datetime import datetime
+
+    now = datetime(2026, 7, 27, 15, 0)
+    service = _service_with_cached_grade(tmp_path, now)
+    path = service._cache_file("LEAD", now)
+    payload = json.loads(path.read_text())
+    payload.pop("graded_at")
+    path.write_text(json.dumps(payload))
+
+    assert service._from_cache("LEAD", now, max_age_minutes=90) is None
+
+
+def test_a_grade_stamped_in_the_future_is_rejected(tmp_path):
+    """A clock skew must not make a grade immortal."""
+    from datetime import datetime, timedelta
+
+    now = datetime(2026, 7, 27, 15, 0)
+    service = _service_with_cached_grade(tmp_path, now + timedelta(hours=2))
+    assert service._from_cache("LEAD", now, max_age_minutes=90) is None
+
+
+def test_force_bypasses_the_cache_entirely(tmp_path, monkeypatch):
+    """What an interactive /grade does: someone asking now is asking about now."""
+    from datetime import datetime
+
+    now = datetime(2026, 7, 27, 15, 0)
+    service = _service_with_cached_grade(tmp_path, now)
+    # No skill and no FMP key, so a real grade cannot happen — the point is that
+    # it *tried* rather than silently serving the cached one.
+    monkeypatch.setattr(service, "skill", lambda: make_skill(tmp_path))
+    outcome = service.grade("LEAD", now, force=True)
+    assert not outcome.ok
+    assert "FMP_API_KEY" in (outcome.skipped or "")

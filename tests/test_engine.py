@@ -29,7 +29,7 @@ class StubBars:
             raise self._error
         return self._bars
 
-    def average_daily_volume(self, bars, sessions):
+    def average_daily_volume(self, bars, sessions, now=None):
         return 10_000_000
 
     def close(self):
