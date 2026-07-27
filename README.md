@@ -18,6 +18,11 @@ Six independent detectors, each switchable and tunable:
 Typical latency is one cron interval — about 5 minutes, occasionally 20 when
 GitHub's scheduler is busy. Comfortably inside a 2-hour target.
 
+Every alert can carry a CAN SLIM scorecard as a PDF, scored against the
+[can-slim-grader](https://github.com/thewongdirection/can-slim-grader) rubric —
+programmatically by default, or with Claude writing the judgement half if you
+[turn the narrator on](#the-narrator-optional).
+
 You control it from Telegram — list and edit the watchlist, pull a ticker's
 14-day signal history, request a CAN SLIM scorecard, and change any threshold or
 switch any level on and off. **`monitor console` gives you that whole surface
@@ -119,6 +124,18 @@ git clone --depth 1 https://github.com/thewongdirection/can-slim-grader vendor/c
 Read [what this actually grades](#can-slim-scorecards) before relying on it —
 the letters are scored programmatically against the skill's published rubric,
 which is not the same thing as the skill's own agent judgement.
+
+Optionally, Claude can supply the judgement half — the per-letter commentary,
+**N**'s "new" story and **I**'s sponsorship quality:
+
+```bash
+pip install -r requirements-narrator.txt   # the anthropic SDK
+export ANTHROPIC_API_KEY=sk-ant-...        # or the ANTHROPIC_API_KEY secret in CI
+```
+
+Then `narrator: llm` under `canslim:` in `config.yaml`, or `/narrator llm` from
+the bot. It cannot change a computed letter — see
+[the narrator](#the-narrator-optional).
 
 ### 2c. Optional: Interactive Brokers
 
@@ -260,6 +277,7 @@ anyone holding it could otherwise edit your watchlist.
 | `/config [X]` · `/set X SETTING VALUE` | Read and change thresholds |
 | `/set TSLA X SETTING VALUE` | Change one setting for one ticker |
 | `/explain X` | Every setting, its allowed range, and the reasoning |
+| `/narrator [SETTING VALUE]` | Who writes the CAN SLIM letters, and what that costs |
 | `/reset [X]` · `/changes` | Back to committed defaults; see the live diff |
 | `/status` | Market state, data-source health, last run |
 
@@ -276,9 +294,12 @@ silently clamped. `2.5M`, `500k` and `1,250,000` all work.
 monitor console             the bot's commands locally, no Telegram needed
 monitor bot                 run the Telegram bot (long-polling)
 monitor grade TICKER        CAN SLIM scorecard + PDF for one ticker
+  --narrate / --no-narrate  override canslim.narrator for this one grade
+  --fresh                   ignore today's cached grade and re-run it
 monitor run                 one polling cycle (what the cron calls)
   --dry-run                 print alerts instead of sending; leaves state untouched
   --force                   run session-bound detectors even when the market is closed
+  --no-grade                don't attach scorecards, whatever attach_canslim says
 monitor validate            strict config check — exits 1 on any problem
 monitor verify              live probe of every provider endpoint
 monitor explain [detector]  thresholds, defaults, bounds and rationale
@@ -369,6 +390,44 @@ turns on quarterly earnings and a multi-month base, so ten alerts on one busy
 name cost one grade. If no PDF engine is present the HTML report is attached
 instead; a missing report never costs you the alert.
 
+### The narrator (optional)
+
+`canslim.narrator: llm` puts an LLM back in the loop for the half the numbers
+cannot settle. Claude gets the computed scorecard, the skill's methodology, and
+optionally a web search, and returns the per-letter commentary plus a judgement
+on **N**'s new driver and **I**'s sponsorship quality.
+
+**What it is not allowed to do matters more than what it does.** A model handed a
+scorecard will rewrite the arithmetic, so the merge is deliberately asymmetric:
+
+| | Narrator may set the score? |
+|---|---|
+| **N**, **I** — the judgement letters | yes, that is the point |
+| any letter the computed pass left `unknown` | yes — it may have the data we lacked |
+| **C, A, S, L, M** with a computed score | **no.** The proposal is discarded, and the rejection is printed on the report |
+
+So the report always tells you which pass produced the letters, and every score
+the narrator set — or tried to set and was refused — appears in the Notes
+section of the PDF, not just in a log. The verdict and the entry/stop band are
+re-derived after any accepted change, so an upgraded letter can't sit next to a
+stale verdict.
+
+It is an upgrade to the grade, never a prerequisite for having one. No key, rate
+limit, safety refusal, malformed JSON, missing `anthropic` package — each is
+recorded as a skip line on the report and you still get the full deterministic
+scorecard.
+
+Costs roughly **$0.10-0.40 and 30-90 seconds per ticker per day** on
+`claude-opus-5`. The methodology document is identical on every call and sits
+behind a prompt-cache breakpoint, so only the first ticker of the hour pays to
+read it; combined with the daily grade cache, a busy watchlist is charged once
+per name per day. `narrator_effort`, `narrator_research` (the web-search phase),
+`narrator_max_tokens` and `narrator_model` are all tunable from `config.yaml` or
+`/narrator`.
+
+To see it on one name without touching the config: `monitor grade NVDA --narrate
+--fresh`.
+
 ## Data source health
 
 A monitor that silently stops seeing data is worse than no monitor, because
@@ -409,8 +468,10 @@ shows current health; the run footer reports changes.
   own; the bot only answers while its process is up. That's the cost of long
   polling instead of a public webhook endpoint.
 - **IBKR needs a logged-in gateway** and cannot run on CI, as above.
-- **CAN SLIM letters are scored programmatically**, not by the skill's own agent
-  judgement, as above.
+- **CAN SLIM letters are scored programmatically** by default, not by the skill's
+  own agent judgement. Turning [the narrator](#the-narrator-optional) on restores
+  the judgement half at a per-grade cost — and even then it can only score N, I
+  and letters that were `unknown`; the measurable letters stay arithmetic.
 - **Not investment advice, and not a trading signal.** Unusual size is a
   prompt to go look, nothing more.
 

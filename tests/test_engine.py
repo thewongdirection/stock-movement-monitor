@@ -361,3 +361,118 @@ def test_state_is_pruned_after_a_run(state):
     later = NOW + timedelta(days=400)
     engine.run(cfg, state, RecordingNotifier(), now=later, providers=providers, force=True)
     assert state.stats()["seen"] <= 1
+
+
+# --------------------------------------------------------------------------
+# The CLI's `run` — what the cron actually invokes
+# --------------------------------------------------------------------------
+CLI_CONFIG = """
+tickers:
+  - NVDA
+  - AAPL
+detectors:
+  volume_anomaly:
+    enabled: true
+run:
+  attach_canslim: true
+"""
+
+
+def _cli_run(monkeypatch, tmp_path, overlay_body: str | None = None, *, extra=()):
+    """Invoke `monitor run --dry-run` and capture what it handed the engine."""
+    from monitor import cli
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(CLI_CONFIG)
+    overlay_path = tmp_path / "runtime.json"
+    if overlay_body is not None:
+        overlay_path.write_text(overlay_body)
+
+    captured: dict = {}
+
+    def fake_run(config, state, notifier, **kwargs):
+        captured["config"] = config
+        captured["kwargs"] = kwargs
+        return engine.RunResult(started_at=NOW)
+
+    monkeypatch.setattr(cli.engine, "run", fake_run)
+    code = cli.main(
+        [
+            "run",
+            "--dry-run",
+            "--config",
+            str(config_path),
+            "--overlay",
+            str(overlay_path),
+            *extra,
+        ]
+    )
+    assert code == 0
+    return captured
+
+
+def test_the_cron_run_picks_up_the_bots_edits(monkeypatch, tmp_path):
+    """Bot edits live in state/runtime.json — a run that ignores it ignores them.
+
+    This is the whole premise of the overlay: change something from Telegram and
+    the next tick honours it without a commit.
+    """
+    from monitor.runtime import Overlay
+
+    overlay = Overlay(path=tmp_path / "runtime.json")
+    overlay.add_ticker("PLTR")
+    overlay.remove_ticker("AAPL", baseline=["NVDA", "AAPL"])
+    overlay.set_detector("volume_anomaly", "rvol_threshold", "4.5")
+    overlay.set_canslim("narrator", "llm")
+    overlay.save()
+
+    captured = _cli_run(monkeypatch, tmp_path, overlay.path.read_text())
+    cfg = captured["config"]
+
+    assert cfg.tickers == ["NVDA", "PLTR"]
+    assert cfg.detector("volume_anomaly")["rvol_threshold"] == 4.5
+    assert cfg.canslim["narrator"] == "llm"
+
+
+def test_a_missing_overlay_is_not_an_error(monkeypatch, tmp_path):
+    """First run, or a lost Actions cache. The committed baseline is enough."""
+    cfg = _cli_run(monkeypatch, tmp_path)["config"]
+    assert cfg.tickers == ["NVDA", "AAPL"]
+
+
+def test_the_cron_run_attaches_scorecards(monkeypatch, tmp_path):
+    """`attach_canslim: true` has to reach the engine, or it silently does nothing."""
+    captured = _cli_run(monkeypatch, tmp_path)
+    assert captured["kwargs"]["canslim"] is not None
+
+
+def test_no_grade_overrides_the_config(monkeypatch, tmp_path):
+    captured = _cli_run(monkeypatch, tmp_path, extra=["--no-grade"])
+    assert captured["kwargs"]["canslim"] is None
+
+
+def test_attach_canslim_off_costs_nothing(monkeypatch, tmp_path):
+    from monitor import cli
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(CLI_CONFIG.replace("attach_canslim: true", "attach_canslim: false"))
+    captured: dict = {}
+    monkeypatch.setattr(
+        cli.engine,
+        "run",
+        lambda config, state, notifier, **kwargs: (
+            captured.update(kwargs) or engine.RunResult(started_at=NOW)
+        ),
+    )
+    code = cli.main(
+        [
+            "run",
+            "--dry-run",
+            "--config",
+            str(config_path),
+            "--overlay",
+            str(tmp_path / "runtime.json"),
+        ]
+    )
+    assert code == 0
+    assert captured["canslim"] is None

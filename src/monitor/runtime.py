@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import DETECTOR_SPECS, RUN_SPECS, TICKER_RE, _apply_presets
+from .config import CANSLIM_SPECS, DETECTOR_SPECS, RUN_SPECS, TICKER_RE, _apply_presets
 from .params import Issue, Param, resolve
 
 
@@ -46,6 +46,7 @@ class Overlay:
     removed_tickers: list[str] = field(default_factory=list)
     detectors: dict[str, dict[str, Any]] = field(default_factory=dict)
     run: dict[str, Any] = field(default_factory=dict)
+    canslim: dict[str, Any] = field(default_factory=dict)
     per_ticker: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
     log: list[Change] = field(default_factory=list)
 
@@ -67,6 +68,7 @@ class Overlay:
             removed_tickers=[str(t).upper() for t in raw.get("removed_tickers", [])],
             detectors=raw.get("detectors", {}) or {},
             run=raw.get("run", {}) or {},
+            canslim=raw.get("canslim", {}) or {},
             per_ticker=raw.get("per_ticker", {}) or {},
             log=[Change(c.get("at", ""), c.get("what", "")) for c in raw.get("log", [])],
         )
@@ -78,6 +80,7 @@ class Overlay:
             "removed_tickers": self.removed_tickers,
             "detectors": self.detectors,
             "run": self.run,
+            "canslim": self.canslim,
             "per_ticker": self.per_ticker,
             # Keep the tail only; this is an audit trail, not a database.
             "log": [{"at": c.at, "what": c.what} for c in self.log[-100:]],
@@ -185,6 +188,25 @@ class Overlay:
         self._record(f"run.{setting} = {resolved[setting]}")
         return f"run.{setting} set to {resolved[setting]}."
 
+    def set_canslim(self, setting: str, value: Any) -> str:
+        if setting not in CANSLIM_SPECS:
+            raise OverlayError(
+                f"unknown canslim setting {setting!r}. Settings: "
+                + ", ".join(sorted(CANSLIM_SPECS))
+            )
+        parsed = _parse_scalar(value, CANSLIM_SPECS[setting])
+        issues: list[Issue] = []
+        candidate = {setting: parsed}
+        resolved = resolve(CANSLIM_SPECS, candidate, "canslim", issues)
+        if issues:
+            raise OverlayError(
+                f"{setting} rejected — {issues[0].message.split(';')[0]}. "
+                f"Allowed: {CANSLIM_SPECS[setting].bounds_text()}."
+            )
+        self.canslim[setting] = resolved[setting]
+        self._record(f"canslim.{setting} = {resolved[setting]}")
+        return f"canslim.{setting} set to {resolved[setting]}."
+
     def set_enabled(self, detector: str, enabled: bool) -> str:
         if detector not in DETECTOR_SPECS:
             raise OverlayError(
@@ -198,6 +220,7 @@ class Overlay:
         if detector is None:
             self.detectors.clear()
             self.run.clear()
+            self.canslim.clear()
             self.per_ticker.clear()
             self._record("reset all thresholds to config.yaml")
             return "All thresholds reset to the committed defaults (watchlist untouched)."
@@ -211,7 +234,14 @@ class Overlay:
 
     def is_empty(self) -> bool:
         return not any(
-            (self.added_tickers, self.removed_tickers, self.detectors, self.run, self.per_ticker)
+            (
+                self.added_tickers,
+                self.removed_tickers,
+                self.detectors,
+                self.run,
+                self.canslim,
+                self.per_ticker,
+            )
         )
 
     def describe(self) -> list[str]:
@@ -225,6 +255,8 @@ class Overlay:
                 out.append(f"{detector}.{key} = {value}")
         for key, value in sorted(self.run.items()):
             out.append(f"run.{key} = {value}")
+        for key, value in sorted(self.canslim.items()):
+            out.append(f"canslim.{key} = {value}")
         for ticker, per in sorted(self.per_ticker.items()):
             for detector, settings in sorted(per.items()):
                 for key, value in sorted(settings.items()):

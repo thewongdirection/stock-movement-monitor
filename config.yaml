@@ -126,6 +126,36 @@ run:
   canslim_min_severity: medium    # don't grade every low-severity alert
 
 # ---------------------------------------------------------------------------
+# CAN SLIM grading
+#
+# The scorecard itself is always computed from figures: EPS and sales growth,
+# ROE, relative strength, base depth, distribution days. Two letters cannot be
+# settled by arithmetic — N's "new" driver (a new product, management change or
+# industry condition) and I's sponsorship quality. Those are the narrator's job.
+#
+# narrator: off   letters scored programmatically; the qualitative halves of N
+#                 and I are flagged as ungraded rather than guessed. Free.
+# narrator: llm   Claude writes the per-letter commentary and judges N and I.
+#                 Needs ANTHROPIC_API_KEY and the optional `anthropic` package
+#                 (pip install anthropic). Roughly $0.10-0.40 and 30-90s per
+#                 ticker per day — grades are cached daily, so a busy name is
+#                 still charged once.
+#
+# The narrator can NEVER change a computed letter. A score it proposes for C, A,
+# S, L or M is rejected, and the rejection is printed on the report itself. It
+# may set a score only for N, for I, or for a letter the computed pass left
+# `unknown` because data was missing. If it fails for any reason — no key, rate
+# limit, refusal, malformed output — you still get the full computed scorecard.
+# ---------------------------------------------------------------------------
+canslim:
+  narrator: off               # off | llm
+  narrator_model: claude-opus-5
+  narrator_effort: medium     # low | medium | high | xhigh | max
+  narrator_research: true     # web-search N's story and recent ownership news
+  narrator_max_tokens: 16000
+  narrator_fallbacks: true    # server-side reroute if a safety classifier declines
+
+# ---------------------------------------------------------------------------
 # Providers
 #
 # The Unusual Whales paths below are the defaults this project ships with.

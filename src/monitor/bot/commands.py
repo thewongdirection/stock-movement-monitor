@@ -19,7 +19,7 @@ from typing import Callable
 
 from .. import config as config_mod
 from ..canslim.service import CanSlimService
-from ..config import DETECTOR_LEVEL, DETECTOR_SPECS, RUN_SPECS, Config
+from ..config import CANSLIM_SPECS, DETECTOR_LEVEL, DETECTOR_SPECS, RUN_SPECS, Config
 from ..params import reference_table
 from ..runtime import Overlay, OverlayError
 from ..state import State
@@ -119,6 +119,7 @@ class CommandRouter:
             "/set DETECTOR SETTING VALUE — change one\n"
             "/set NVDA DETECTOR SETTING VALUE — for one ticker only\n"
             "/run SETTING VALUE — global run settings\n"
+            "/narrator [SETTING VALUE] — who writes the CAN SLIM letters\n"
             "/explain DETECTOR — every setting, its range and why\n"
             "/reset [DETECTOR] — back to the committed defaults\n"
             "/changes — what has been changed from config.yaml\n"
@@ -445,6 +446,66 @@ class CommandRouter:
         self._persist()
         return Reply(f"✅ {html.escape(message)}", dirty=True)
 
+    def cmd_narrator(self, args: list[str]) -> Reply:
+        """Show or change who writes the CAN SLIM letters.
+
+        Its own command rather than a `/set` scope: turning the narrator on spends
+        money per grade, so it should be hard to do by accident.
+        """
+        if not args:
+            return self._narrator_status()
+        if len(args) == 1:
+            # `/narrator llm` and `/narrator off` are what anyone will type first.
+            setting, value = "narrator", args[0]
+        else:
+            setting, value = args[0].lower(), " ".join(args[1:])
+            # Every key already starts with `narrator_`; typing it twice after
+            # /narrator is nobody's intention.
+            if setting not in CANSLIM_SPECS and f"narrator_{setting}" in CANSLIM_SPECS:
+                setting = f"narrator_{setting}"
+        message = self.ctx.overlay.set_canslim(setting, value)
+        self._persist()
+        return Reply(
+            f"✅ {html.escape(message)}",
+            buttons=[Button("Show narrator", "narrator")],
+            dirty=True,
+        )
+
+    def _narrator_status(self) -> Reply:
+        settings = self.ctx.config.canslim
+        on = settings.get("narrator") == "llm"
+        lines = [
+            f"<b>CAN SLIM narrator</b> — {'🟢 Claude' if on else '⚪ off (computed only)'}\n",
+            "The measurable letters (C, A, S, L, M) are always computed from the "
+            "figures and the narrator <i>cannot</i> change them. What it adds is the "
+            "per-letter commentary and a judgement on N's new driver and I's "
+            "sponsorship quality.\n"
+            if on
+            else "With it off, N's \"new\" story and I's sponsorship quality are "
+            "reported as ungraded rather than guessed at.\n",
+        ]
+        for key, value in settings.items():
+            spec = CANSLIM_SPECS[key]
+            changed = key in self.ctx.overlay.canslim
+            lines.append(
+                f"<code>{key}</code> = <b>{_fmt(value)}</b>"
+                + (" ✏️" if changed else "")
+                + f"\n    <i>{spec.bounds_text()}</i>"
+            )
+        lines.append(
+            "\n<code>/narrator llm</code> to turn it on, <code>/narrator off</code> "
+            "to turn it off.\n<code>/narrator SETTING VALUE</code> for the rest."
+        )
+        if on:
+            lines.append(
+                "\n<i>Costs roughly $0.10-0.40 per ticker per day; grades are cached "
+                "daily, so a busy name is charged once. Needs ANTHROPIC_API_KEY.</i>"
+            )
+        return Reply(
+            "\n".join(lines),
+            buttons=[Button("Turn off" if on else "Turn on", f"narrator {'off' if on else 'llm'}")],
+        )
+
     def cmd_explain(self, args: list[str]) -> Reply:
         if not args:
             return Reply(
@@ -556,6 +617,7 @@ HANDLERS = {
     "hist": "cmd_history",
     "grade": "cmd_grade",
     "canslim": "cmd_grade",
+    "narrator": "cmd_narrator",
     "levels": "cmd_levels",
     "on": "cmd_on",
     "enable": "cmd_on",

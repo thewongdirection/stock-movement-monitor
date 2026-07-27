@@ -1,2 +1,6 @@
 requests>=2.32,<3
 PyYAML>=6.0,<7
+
+# The LLM narrator (`canslim.narrator: llm`) additionally needs
+# requirements-narrator.txt. It is deliberately separate: the deterministic
+# CAN SLIM scorecard, and everything else here, works without it.

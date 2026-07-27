@@ -32,6 +32,10 @@ jobs:
   poll:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Job-level so a step's own `if` can test it — a step cannot read env it
+    # declares itself, and the `secrets` context is not guaranteed in `if`.
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +45,12 @@ jobs:
           cache: pip
 
       - run: pip install -r requirements.txt
+
+      # Only pulled when there is a key to use it with. Without it the CAN SLIM
+      # letters are scored programmatically, which is the default anyway.
+      - name: Install the narrator dependency
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        run: pip install -r requirements-narrator.txt
 
       # The CAN SLIM grader is a separate repo. Shallow-cloned each run so
       # methodology changes are picked up; grading degrades gracefully if this
@@ -83,6 +93,7 @@ jobs:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           UW_API_KEY: ${{ secrets.UW_API_KEY }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CANSLIM_SKILL_PATH: vendor/can-slim-grader
 
       # Saved even when the poll step failed, so a transient provider outage

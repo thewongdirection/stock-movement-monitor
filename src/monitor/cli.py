@@ -82,6 +82,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run session-bound detectors even when the market is closed",
     )
+    run_p.add_argument(
+        "--overlay",
+        default=DEFAULT_OVERLAY,
+        help="runtime overlay written by the bot, merged over config.yaml",
+    )
+    run_p.add_argument(
+        "--no-grade",
+        action="store_true",
+        help="don't attach CAN SLIM scorecards, whatever run.attach_canslim says",
+    )
     run_p.set_defaults(handler=cmd_run)
 
     validate_p = with_config(sub.add_parser("validate", help="strict config check"))
@@ -128,6 +138,22 @@ def _build_parser() -> argparse.ArgumentParser:
     grade_p = with_config(sub.add_parser("grade", help="CAN SLIM scorecard for a ticker"))
     grade_p.add_argument("ticker")
     grade_p.add_argument("--no-pdf", action="store_true", help="skip the PDF export")
+    grade_p.add_argument(
+        "--narrate",
+        action="store_true",
+        help="have Claude write the per-letter prose and judge N and I "
+        "(needs an Anthropic key; overrides canslim.narrator)",
+    )
+    grade_p.add_argument(
+        "--no-narrate",
+        action="store_true",
+        help="force the deterministic pass only, even if config enables the narrator",
+    )
+    grade_p.add_argument(
+        "--fresh",
+        action="store_true",
+        help="ignore today's cached grade and re-grade from scratch",
+    )
     grade_p.set_defaults(handler=cmd_grade)
 
     return parser
@@ -151,13 +177,21 @@ def _bot_context(args: argparse.Namespace) -> BotContext:
     )
 
 
-def _canslim(cfg: config_mod.Config, want_pdf: bool = True) -> CanSlimService:
+def _canslim(
+    cfg: config_mod.Config, want_pdf: bool = True, narrate: bool | None = None
+) -> CanSlimService:
+    from .canslim.narrate import config_from
+
+    narrator = config_from(cfg.canslim)
+    if narrate is not None:
+        narrator.enabled = narrate
     return CanSlimService(
         fmp_api_key=os.environ.get("FMP_API_KEY", ""),
         fmp_base_url=cfg.providers.fmp_base_url,
         cache_dir=os.environ.get("CANSLIM_REPORT_DIR", DEFAULT_REPORTS),
         skill_path=os.environ.get("CANSLIM_SKILL_PATH") or None,
         want_pdf=want_pdf,
+        narrator=narrator,
     )
 
 
@@ -188,7 +222,13 @@ def cmd_bot(args: argparse.Namespace) -> int:
 
 def cmd_grade(args: argparse.Namespace) -> int:
     cfg = config_mod.load(args.config, strict=False)
-    service = _canslim(cfg, want_pdf=not args.no_pdf)
+    narrate = True if args.narrate else (False if args.no_narrate else None)
+    service = _canslim(cfg, want_pdf=not args.no_pdf, narrate=narrate)
+    if args.fresh:
+        # Grades are cached once per ticker per day; --fresh is how you re-run
+        # after changing the narrator settings without waiting for tomorrow.
+        cache = service._cache_file(args.ticker.upper(), datetime.now())
+        cache.unlink(missing_ok=True)
     outcome = service.grade(args.ticker.upper())
     service.close()
 
@@ -207,6 +247,10 @@ def cmd_grade(args: argparse.Namespace) -> int:
         print(f"  {letter.key}  {mark}  {letter.actual}")
     print(f"\n  entry: {grade.entry}")
     print(f"  stop:  {grade.stop}")
+    if grade.narrated:
+        print("\n  narrated by Claude:")
+        for note in grade.narrator_notes:
+            print(f"    · {note}")
     for warning in grade.warnings:
         print(f"  ! {warning}")
     print(f"\n  HTML: {report.html_path}")
@@ -219,15 +263,27 @@ def cmd_grade(args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------
 def cmd_run(args: argparse.Namespace) -> int:
-    cfg = config_mod.load(args.config, strict=False)
+    # The overlay carries the bot's live edits. Loading it here is what makes a
+    # Telegram change take effect on the next cron tick without a commit.
+    overlay = Overlay.load(args.overlay)
+    cfg = config_mod.load(args.config, strict=False, overlay=overlay)
     for issue in cfg.issues:
         logging.warning("config: %s: %s", issue.path, issue.message)
+    for change in overlay.describe():
+        logging.info("overlay: %s", change)
 
     notifier = ConsoleNotifier() if args.dry_run else _telegram()
     state_path = ":memory:" if args.dry_run else args.state
 
-    with State(state_path) as state:
-        result = engine.run(cfg, state, notifier, force=args.force)
+    canslim = None
+    if bool(cfg.run["attach_canslim"]) and not args.no_grade:
+        canslim = _canslim(cfg)
+    try:
+        with State(state_path) as state:
+            result = engine.run(cfg, state, notifier, force=args.force, canslim=canslim)
+    finally:
+        if canslim is not None:
+            canslim.close()
 
     print(f"\n{result.summary()} · {result.session_note}")
     if not result.ran_session_detectors:
@@ -446,6 +502,8 @@ def _missing_secrets(cfg: config_mod.Config) -> list[tuple[str, str]]:
         wanted.append(("FMP_API_KEY", "intraday bars for the volume detector"))
     if cfg.needs("trades") or cfg.needs("flow"):
         wanted.append(("UW_API_KEY", "dark pool prints and options flow"))
+    if cfg.canslim.get("narrator") == "llm":
+        wanted.append(("ANTHROPIC_API_KEY", "CAN SLIM narration (canslim.narrator: llm)"))
     ua = cfg.providers.sec_user_agent
     if cfg.needs("insider") and (not ua or is_placeholder_user_agent(ua)):
         wanted.append(

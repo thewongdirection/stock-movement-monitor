@@ -1,0 +1,4 @@
+# Only needed for `canslim.narrator: llm` — Claude writes the per-letter
+# commentary and judges N and I. Without this the narrator reports itself
+# unavailable and you still get the full computed scorecard.
+anthropic>=0.120

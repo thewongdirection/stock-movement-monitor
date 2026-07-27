@@ -9,6 +9,11 @@ description = "Alerts on unusually large trades, options flow and insider filing
 requires-python = ">=3.11"
 dependencies = ["requests>=2.32,<3", "PyYAML>=6.0,<7"]
 
+# The LLM narrator for the CAN SLIM scorecard. Optional on purpose: without it
+# the letters are still scored, just programmatically.
+[project.optional-dependencies]
+narrator = ["anthropic>=0.120"]
+
 [project.scripts]
 monitor = "monitor.cli:main"
 

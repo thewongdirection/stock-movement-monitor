@@ -394,3 +394,58 @@ def test_console_shows_attachments(router, tmp_path):
     assert "attachment" in rendered
     assert "NVDA-canslim.pdf" in rendered
     assert "bytes" in rendered
+
+
+# --------------------------------------------------------------------------
+# /narrator
+# --------------------------------------------------------------------------
+def test_narrator_shows_its_state_and_offers_the_switch(router):
+    reply = router.handle("/narrator")
+    text = plain(reply.text)
+    assert "off (computed only)" in text
+    assert "ungraded rather than guessed" in text
+    assert [b.command for b in reply.buttons] == ["narrator llm"]
+
+
+def test_a_bare_backend_name_is_enough_to_switch_it_on(router):
+    """`/narrator llm` is what anyone will type; it must not need the key name."""
+    reply = router.handle("/narrator llm")
+    assert "canslim.narrator set to llm" in plain(reply.text)
+    assert router.ctx.config.canslim["narrator"] == "llm"
+    assert reply.dirty is True
+
+
+def test_turning_it_on_declares_the_cost_and_the_guardrail(router):
+    router.handle("/narrator llm")
+    text = plain(router.handle("/narrator").text)
+    assert "🟢 Claude" in text
+    assert "cannot" in text and "C, A, S, L, M" in text
+    assert "ANTHROPIC_API_KEY" in text
+    assert "$0.10-0.40 per ticker per day" in text
+
+
+def test_the_narrator_prefix_is_optional_on_a_setting(router):
+    assert "narrator_effort set to high" in plain(router.handle("/narrator effort high").text)
+    assert router.ctx.config.canslim["narrator_effort"] == "high"
+
+
+def test_a_rejected_narrator_setting_says_what_is_allowed(router):
+    reply = router.handle("/narrator max_tokens 999999")
+    assert "rejected" in reply.text
+    assert "2,000 to 64,000" in reply.text
+    assert router.ctx.config.canslim["narrator_max_tokens"] == 16000
+
+
+def test_the_narrator_change_shows_up_in_changes(router):
+    router.handle("/narrator llm")
+    assert "canslim.narrator = llm" in plain(router.handle("/changes").text)
+
+
+def test_reset_puts_the_narrator_back(router):
+    router.handle("/narrator llm")
+    router.handle("/reset")
+    assert router.ctx.config.canslim["narrator"] == "off"
+
+
+def test_help_mentions_the_narrator(router):
+    assert "/narrator" in router.handle("/help").text

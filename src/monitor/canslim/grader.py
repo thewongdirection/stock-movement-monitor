@@ -79,6 +79,15 @@ class Grade:
     warnings: list[str] = field(default_factory=list)
     data_sources: str = "IBKR/FMP price + FMP fundamentals"
 
+    #: True once the LLM narrator has written the per-letter prose. The report
+    #: says which pass produced the letters, because they are not equivalent:
+    #: the computed pass cannot judge N's "new" story or I's sponsorship quality.
+    narrated: bool = False
+    #: Audit trail: every score the narrator set, and every one it proposed for a
+    #: computed letter and had rejected.
+    narrator_notes: list[str] = field(default_factory=list)
+    narrator_sources: list[dict] = field(default_factory=list)
+
     @property
     def score(self) -> float:
         return sum(POINTS[letter.score] for letter in self.letters)

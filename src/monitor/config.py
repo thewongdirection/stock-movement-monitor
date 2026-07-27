@@ -360,6 +360,55 @@ DETECTOR_LEVEL = {
     "insider_trades": "Form 4",
 }
 
+# --------------------------------------------------------------------------
+# CAN SLIM grading — the deterministic rubric pass, and the optional LLM narrator
+# --------------------------------------------------------------------------
+CANSLIM_SPECS = {
+    "narrator": Param(
+        "off",
+        choices=("off", "llm"),
+        kind="str",
+        doc="'off' scores every letter programmatically against the skill's "
+        "rubric. 'llm' additionally has Claude write the per-letter prose and "
+        "judge the two letters numbers cannot settle — N's 'new' driver and I's "
+        "sponsorship quality. Needs an Anthropic API key and costs per grade.",
+    ),
+    "narrator_model": Param(
+        "claude-opus-5",
+        kind="str",
+        doc="Which Claude model narrates. Leave at the default unless you have a "
+        "specific reason to change tier.",
+    ),
+    "narrator_effort": Param(
+        "medium",
+        choices=("low", "medium", "high", "xhigh", "max"),
+        kind="str",
+        doc="Reasoning effort for the narration call. 'medium' is a good balance "
+        "for prose over already-computed figures; raise it if the reads read thin.",
+    ),
+    "narrator_research": Param(
+        True,
+        kind="bool",
+        doc="Let the narrator web-search for the 'new' driver and recent "
+        "sponsorship news. This is what makes N genuinely gradeable rather than "
+        "scored on its chart half alone. Adds a call per grade.",
+    ),
+    "narrator_max_tokens": Param(
+        16000,
+        lo=2_000,
+        hi=64_000,
+        kind="int",
+        doc="Output ceiling for the narration call. Thinking and response text "
+        "share this budget, so do not set it tight.",
+    ),
+    "narrator_fallbacks": Param(
+        True,
+        kind="bool",
+        doc="Ask the API to re-run a safety-declined request on a fallback model "
+        "automatically. Costs nothing when nothing is declined.",
+    ),
+}
+
 RUN_SPECS = {
     "extended_hours": Param(
         False,
@@ -462,6 +511,7 @@ class Config:
     detectors: dict[str, dict[str, Any]]
     run: dict[str, Any]
     providers: ProviderConfig
+    canslim: dict[str, Any] = field(default_factory=dict)
     overrides: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
     issues: list[Issue] = field(default_factory=list)
     #: The watchlist as committed in config.yaml, before any runtime overlay.
@@ -547,6 +597,9 @@ def from_dict(
         )
 
     run = resolve(RUN_SPECS, data.get("run") or {}, "run", issues)
+    canslim = resolve(
+        CANSLIM_SPECS, _yaml_off_on(data.get("canslim") or {}), "canslim", issues
+    )
     overrides = _clean_overrides(data.get("overrides") or {}, tickers, issues)
     providers = _provider_config(data.get("providers") or {}, issues)
 
@@ -563,7 +616,21 @@ def from_dict(
         overrides=overrides,
         issues=issues,
         baseline_tickers=baseline_tickers,
+        canslim=canslim,
     )
+
+
+def _yaml_off_on(settings: Any) -> Any:
+    """Read a bare `narrator: off` the way whoever typed it meant it.
+
+    YAML 1.1 turns unquoted ``off``/``on`` into booleans, so the obvious thing to
+    write in a config file arrives here as ``False``. Rejecting that would be
+    technically correct and useless. ``off`` means off; ``on`` means the only
+    backend there is.
+    """
+    if not isinstance(settings, dict) or not isinstance(settings.get("narrator"), bool):
+        return settings
+    return {**settings, "narrator": "llm" if settings["narrator"] else "off"}
 
 
 def _merge_overlay(data: dict[str, Any], overlay: Any) -> dict[str, Any]:
@@ -576,6 +643,7 @@ def _merge_overlay(data: dict[str, Any], overlay: Any) -> dict[str, Any]:
     merged["detectors"] = detectors
 
     merged["run"] = {**(merged.get("run") or {}), **(overlay.run or {})}
+    merged["canslim"] = {**(merged.get("canslim") or {}), **(getattr(overlay, "canslim", None) or {})}
 
     overrides = {
         k: {d: dict(s or {}) for d, s in (v or {}).items()}

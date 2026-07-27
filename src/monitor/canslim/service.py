@@ -20,6 +20,7 @@ from ..providers.base import ProviderError
 from ..providers.fmp import FMPProvider
 from .fundamentals import FMPFundamentals, Fundamentals
 from .grader import Grade, grade_ticker, today_key
+from .narrate import NarratorConfig, NarratorResult, apply as narrate_apply
 from .report import Report, build_report
 from .skill import SkillNotAvailable, SkillPaths, find_skill
 
@@ -51,9 +52,11 @@ class CanSlimService:
         skill_path: str | None = None,
         want_pdf: bool = True,
         timeout: int = 30,
+        narrator: NarratorConfig | None = None,
     ):
         self.cache_dir = Path(cache_dir)
         self.want_pdf = want_pdf
+        self.narrator = narrator or NarratorConfig()
         self._skill_path = skill_path
         self._skill: SkillPaths | None = None
         self._skill_error: str | None = None
@@ -124,6 +127,25 @@ class CanSlimService:
             fundamentals=fundamentals,
             now=now,
         )
+
+        # The narrator writes the per-letter prose and judges N and I. A failure
+        # here leaves the deterministic scorecard intact — it is an upgrade to
+        # the grade, never a prerequisite for having one.
+        if self.narrator.enabled:
+            grade, narration = narrate_apply(
+                grade, self.narrator, skill, today=today_key(now)
+            )
+            if not narration.ok:
+                grade.warnings.append(f"narration skipped: {narration.skipped}")
+                log.info("narration skipped for %s: %s", ticker, narration.skipped)
+            else:
+                log.info(
+                    "narrated %s (%d applied, %d rejected score change(s))",
+                    ticker,
+                    len(narration.applied_scores),
+                    len(narration.rejected_scores),
+                )
+
         report = build_report(
             grade, skill, self._report_dir(ticker, now), want_pdf=self.want_pdf
         )
@@ -198,6 +220,9 @@ class CanSlimService:
                             for letter in report.grade.letters
                         ],
                         "warnings": report.grade.warnings,
+                        "narrated": report.grade.narrated,
+                        "narrator_notes": report.grade.narrator_notes,
+                        "narrator_sources": report.grade.narrator_sources,
                     },
                 },
                 indent=2,
@@ -234,4 +259,7 @@ def _thin_grade(ticker: str, summary: dict) -> Grade:
         tone=summary.get("tone", "pressure"),
         summary=summary.get("summary", ""),
         warnings=summary.get("warnings", []),
+        narrated=bool(summary.get("narrated")),
+        narrator_notes=summary.get("narrator_notes", []),
+        narrator_sources=summary.get("narrator_sources", []),
     )

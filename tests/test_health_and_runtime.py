@@ -350,3 +350,60 @@ def test_describe_lists_every_change(overlay):
     assert "PLTR" in described
     assert "dark_pool.min_notional" in described
     assert "run.min_severity" in described
+
+
+# --------------------------------------------------------------------------
+# Narrator settings in the overlay
+# --------------------------------------------------------------------------
+def test_narrator_can_be_switched_on_from_the_overlay(overlay):
+    assert overlay.set_canslim("narrator", "llm") == "canslim.narrator set to llm."
+    cfg = config_mod.from_dict({"tickers": ["AAPL"]}, overlay=overlay)
+    assert cfg.canslim["narrator"] == "llm"
+
+
+def test_an_unknown_narrator_backend_is_rejected_not_clamped(overlay):
+    """Bot edits are rejected rather than silently corrected, same as thresholds."""
+    with pytest.raises(OverlayError) as exc:
+        overlay.set_canslim("narrator", "gpt")
+    assert "not allowed" in str(exc.value)
+    assert overlay.canslim == {}
+
+
+def test_an_out_of_range_token_budget_is_rejected(overlay):
+    with pytest.raises(OverlayError) as exc:
+        overlay.set_canslim("narrator_max_tokens", "999999")
+    assert "2,000 to 64,000" in str(exc.value)
+
+
+def test_an_unknown_narrator_setting_names_the_valid_ones(overlay):
+    with pytest.raises(OverlayError) as exc:
+        overlay.set_canslim("temperature", "0.7")
+    assert "narrator_effort" in str(exc.value)
+
+
+def test_narrator_research_takes_the_boolean_synonyms(overlay):
+    overlay.set_canslim("narrator_research", "off")
+    assert overlay.canslim["narrator_research"] is False
+
+
+def test_narrator_settings_survive_a_save_and_reload(tmp_path):
+    path = tmp_path / "runtime.json"
+    first = Overlay(path=path)
+    first.set_canslim("narrator", "llm")
+    first.set_canslim("narrator_effort", "high")
+    first.save()
+
+    second = Overlay.load(path)
+    assert second.canslim == {"narrator": "llm", "narrator_effort": "high"}
+    assert not second.is_empty()
+
+
+def test_reset_all_also_drops_the_narrator_change(overlay):
+    overlay.set_canslim("narrator", "llm")
+    overlay.reset()
+    assert overlay.canslim == {}
+
+
+def test_describe_reports_the_narrator_change(overlay):
+    overlay.set_canslim("narrator", "llm")
+    assert "canslim.narrator = llm" in overlay.describe()
