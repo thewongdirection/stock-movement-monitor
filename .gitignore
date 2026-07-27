@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Local secrets — never commit
+.env
+
+# Local state (CI keeps its own copy in the Actions cache)
+state/
+*.db
+*.db-journal

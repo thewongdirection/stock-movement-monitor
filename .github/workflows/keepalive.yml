@@ -1,0 +1,38 @@
+name: keepalive
+
+# GitHub disables scheduled workflows in a repository with no activity for 60
+# days. The monitor is meant to run untouched for months, so this commits a
+# heartbeat once a week purely to keep the scheduler enabled.
+on:
+  schedule:
+    - cron: "17 12 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record a heartbeat
+        run: |
+          mkdir -p .github
+          date -u +"last keepalive: %Y-%m-%dT%H:%M:%SZ" > .github/keepalive.txt
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet .github/keepalive.txt; then
+            echo "nothing changed"
+            exit 0
+          fi
+          git add .github/keepalive.txt
+          git commit -m "chore: keepalive heartbeat [skip ci]"
+          git push

@@ -1,0 +1,135 @@
+# ---------------------------------------------------------------------------
+# Stock movement monitor
+#
+# Copy to config.yaml and edit. Every threshold below is optional — omit it and
+# the documented default applies. Run `monitor explain` for the full reference
+# with allowed ranges, or `monitor validate` to check your edits.
+#
+# Out-of-range values are clamped at run time and reported in a Telegram
+# footer, so a typo degrades the monitor instead of silently killing it.
+# `monitor validate` treats the same problem as a hard error — run it in CI.
+# ---------------------------------------------------------------------------
+
+tickers:
+  - NVDA
+  - AAPL
+  - TSLA
+  - MSFT
+
+# ---------------------------------------------------------------------------
+# Which signals to run. Each is independent — turn any of them off.
+#
+#   volume_anomaly  L1     abnormal volume on aggregated bars       (needs FMP)
+#   block_trades    L2     individual large prints                  (needs UW)
+#   dark_pool       L2     off-exchange prints by value / %ADV      (needs UW)
+#   options_flow    L3     unusual options premium                  (needs UW)
+#   insider_trades  Form 4 SEC filings                              (free)
+#
+# Note: with Unusual Whales as the trades provider, block_trades and dark_pool
+# read the same off-exchange print stream and differ only in how they threshold
+# it. They will not double-alert on one print, but enabling just one gives the
+# cleanest results. dark_pool is the better default of the two.
+# ---------------------------------------------------------------------------
+detectors:
+
+  # ---- L1 -----------------------------------------------------------------
+  volume_anomaly:
+    enabled: true
+    bar_interval: 5min        # 1min | 5min | 15min
+    rvol_threshold: 2.0       # 2x normal is the standard "unusual" line
+    zscore_threshold: 3.0     # 3 sigma above the same-time-of-day mean
+    combine: all              # require both tests; "any" is far noisier
+    baseline_sessions: 20     # matches the usual 20-day average volume
+    min_bar_notional: 250000  # ignore thin bars
+    min_price_move_pct: 0.0   # optional confirmation; 0 = off
+    warmup_minutes: 5         # skip the opening auction distortion
+    cooldown_minutes: 60
+
+  # ---- L2 -----------------------------------------------------------------
+  block_trades:
+    enabled: false            # dark_pool covers the same stream; see note above
+    preset: institutional     # classic (10k sh / $200k) | institutional | mega
+    combine: any
+    min_pct_of_adv: 0.25
+    off_exchange_only: false
+    cooldown_minutes: 15
+
+  dark_pool:
+    enabled: true
+    min_notional: 1000000
+    min_pct_of_adv: 0.5
+    combine: any
+    cooldown_minutes: 15
+
+  # ---- L3 -----------------------------------------------------------------
+  options_flow:
+    enabled: true
+    min_premium: 100000       # the conventional "whale" floor
+    require_volume_gt_oi: true  # implies a newly opened position
+    trade_types: [sweep, block, split]
+    max_dte: 365              # long-dated flow is usually hedging
+    exclude_deep_itm_pct: 20.0
+    cooldown_minutes: 15
+
+  # ---- Form 4 -------------------------------------------------------------
+  insider_trades:
+    enabled: true
+    alert_on: [purchase, sale]   # add: exercise, grant, gift, tax, other
+    min_notional_purchase: 100000
+    min_notional_sale: 500000    # sales are noisier, so the bar is higher
+    exclude_10b5_1_sales: true   # pre-scheduled sales carry little signal
+    include_derivative: false
+    cluster_window_days: 30      # several insiders buying = strongest signal
+    cluster_min_insiders: 2
+    lookback_days: 7
+
+# ---------------------------------------------------------------------------
+# Per-ticker overrides. Same settings, same bounds — only the keys you list
+# here are changed for that symbol.
+# ---------------------------------------------------------------------------
+overrides:
+  TSLA:
+    volume_anomaly:
+      rvol_threshold: 3.0     # habitually busy; needs a higher bar
+    dark_pool:
+      min_notional: 5000000
+
+# ---------------------------------------------------------------------------
+# Run behaviour
+# ---------------------------------------------------------------------------
+run:
+  extended_hours: false           # also poll pre-market and after-hours
+  cold_start_lookback_minutes: 30 # cap on replay when state is lost
+  max_alerts_per_run: 25          # global circuit breaker
+  min_severity: low               # low | medium | high
+  state_retention_days: 30
+
+# ---------------------------------------------------------------------------
+# Providers
+#
+# The Unusual Whales paths below are the defaults this project ships with.
+# Their API documentation is not readable without an account, so if `monitor
+# verify` reports a 404 on one of these, correct the path here — no code change
+# is needed.
+# ---------------------------------------------------------------------------
+providers:
+  bars: fmp
+  trades: unusual_whales
+  flow: unusual_whales
+  insider: sec_edgar
+  request_timeout: 30
+
+  unusual_whales:
+    base_url: https://api.unusualwhales.com
+    paths:
+      dark_pool_ticker: /api/darkpool/{ticker}
+      dark_pool_recent: /api/darkpool/recent
+      flow_alerts: /api/option-trades/flow-alerts
+      ticker_flow_alerts: /api/stock/{ticker}/flow-alerts
+      stock_ohlc: /api/stock/{ticker}/ohlc/{interval}
+      stock_info: /api/stock/{ticker}/info
+
+  sec:
+    # SEC's fair-access policy requires a real contact address here.
+    # Overridden by the SEC_USER_AGENT environment variable.
+    user_agent: "stock-movement-monitor you@example.com"

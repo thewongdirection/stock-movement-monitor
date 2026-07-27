@@ -1,0 +1,84 @@
+name: monitor
+
+# Every 5 minutes. GitHub's scheduler is best-effort and often runs 5-20
+# minutes late under load, which is fine against a 2-hour target but is the
+# reason this is not a latency-critical design. The cron is deliberately wider
+# than market hours so SEC Form 4 filings — which arrive on EDGAR until roughly
+# 22:00 ET — are still picked up after the close; the monitor gates the
+# price-driven detectors on session hours itself.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print alerts instead of sending them"
+        type: boolean
+        default: false
+      force:
+        description: "Run session-bound detectors even if the market is closed"
+        type: boolean
+        default: false
+
+concurrency:
+  # Never let a slow run overlap the next tick — two runs would race on state.
+  group: monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # The state database carries dedup keys and read watermarks. Cache keys
+      # must be unique to save, so this writes a per-run key and restores the
+      # newest previous one by prefix. Losing the cache is safe: the monitor
+      # falls back to run.cold_start_lookback_minutes rather than replaying a
+      # whole day of alerts.
+      - name: Restore state
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: monitor-state-${{ github.run_id }}
+          restore-keys: |
+            monitor-state-
+
+      - name: Validate config
+        run: python -m monitor validate
+        env:
+          PYTHONPATH: src
+
+      - name: Poll
+        run: |
+          python -m monitor run \
+            ${{ inputs.dry_run && '--dry-run' || '' }} \
+            ${{ inputs.force && '--force' || '' }}
+        env:
+          PYTHONPATH: src
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          UW_API_KEY: ${{ secrets.UW_API_KEY }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+
+      # Saved even when the poll step failed, so a transient provider outage
+      # does not also cost us the dedup table.
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: monitor-state-${{ github.run_id }}
