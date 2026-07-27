@@ -7,7 +7,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from ..models import Alert, Bar, InsiderTransaction, OptionTrade, Severity, Trade
+from ..models import (
+    Alert,
+    Bar,
+    InsiderTransaction,
+    OptionTrade,
+    OptionVolumeSnapshot,
+    Severity,
+    Trade,
+)
 from ..state import State
 
 
@@ -29,6 +37,8 @@ class Context:
     option_trades: list[OptionTrade] = field(default_factory=list)
     #: Form 4 lines parsed for this ticker.
     insider_transactions: list[InsiderTransaction] = field(default_factory=list)
+    #: Chain-level option volume, when an IBKR gateway is configured.
+    option_volume: OptionVolumeSnapshot | None = None
     #: Average daily volume, or None when no bars provider is configured.
     adv: float | None = None
     #: Print IDs already claimed this run. `block_trades` and `dark_pool` read

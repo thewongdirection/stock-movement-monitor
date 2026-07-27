@@ -9,6 +9,9 @@ Design notes worth knowing when changing this:
 * **Market-hours gating is per detector.** Price and flow detectors only make
   sense while the market is trading, but Form 4 filings arrive on EDGAR until
   roughly 22:00 ET, so the insider detector runs whenever the cron fires.
+* **Every fetch passes through the health tracker.** Unresponsive, stale and
+  corrupt are three different failures with three different checks — see
+  `health.py`. Corrupt bars are dropped before a detector can alert on them.
 * **One ticker's failure never ends the run.** Provider errors are collected
   and reported; the remaining tickers still get processed.
 * **Progress is only recorded for alerts that were actually delivered** — see
@@ -22,6 +25,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import market_calendar as cal
 from .config import Config
@@ -32,12 +36,16 @@ from .detectors import (
     Detector,
     InsiderTradeDetector,
     OptionsFlowDetector,
+    OptionVolumeDetector,
     VolumeAnomalyDetector,
 )
-from .models import Alert, Severity
+from .detectors.volume_anomaly import INTERVAL_MINUTES
+from .health import HealthTracker, inspect_bars, inspect_events
+from .models import Alert, OptionVolumeSnapshot, Severity
 from .notify.base import Notifier
 from .providers.base import ProviderError, SetupError
 from .providers.fmp import FMPProvider
+from .providers.ibkr import IBKRProvider
 from .providers.sec_edgar import SECEdgarProvider, default_since
 from .providers.unusual_whales import UnusualWhalesProvider
 from .state import State
@@ -45,7 +53,9 @@ from .state import State
 log = logging.getLogger(__name__)
 
 #: Detectors that only make sense while the market is trading.
-SESSION_BOUND = frozenset({"volume_anomaly", "block_trades", "dark_pool", "options_flow"})
+SESSION_BOUND = frozenset(
+    {"volume_anomaly", "block_trades", "dark_pool", "options_flow", "option_volume"}
+)
 
 DETECTOR_CLASSES: dict[str, type[Detector]] = {
     d.name: d
@@ -54,6 +64,7 @@ DETECTOR_CLASSES: dict[str, type[Detector]] = {
         BlockTradeDetector,
         DarkPoolDetector,
         OptionsFlowDetector,
+        OptionVolumeDetector,
         InsiderTradeDetector,
     )
 }
@@ -70,6 +81,8 @@ class RunResult:
     errors: list[str] = field(default_factory=list)
     session_note: str = ""
     ran_session_detectors: bool = True
+    health_summary: str = ""
+    graded: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -80,6 +93,11 @@ class RunResult:
         if message not in self.errors:
             self.errors.append(message)
 
+    def note(self, message: str) -> None:
+        """Record a note once — the same condition often recurs per alert."""
+        if message not in self.notes:
+            self.notes.append(message)
+
     def summary(self) -> str:
         bits = [f"{len(self.delivered)} alert(s) sent"]
         if self.duplicates:
@@ -88,6 +106,8 @@ class RunResult:
             bits.append(f"{self.below_threshold} below min_severity")
         if self.capped:
             bits.append(f"{self.capped} capped")
+        if self.graded:
+            bits.append(f"{len(self.graded)} graded")
         if self.errors:
             bits.append(f"{len(self.errors)} error(s)")
         return ", ".join(bits)
@@ -96,8 +116,9 @@ class RunResult:
 class Providers:
     """Lazily constructed provider handles, built only if a detector needs them.
 
-    A construction failure (missing key, placeholder SEC contact) is cached and
-    re-raised, so it costs one report per run instead of one per ticker.
+    A construction failure (missing key, placeholder SEC contact, no IBKR
+    gateway) is cached and re-raised, so it costs one report per run instead of
+    one per ticker.
     """
 
     def __init__(self, config: Config):
@@ -117,7 +138,10 @@ class Providers:
         return self._built[role]
 
     @property
-    def bars(self) -> FMPProvider:
+    def bars(self):
+        """Whichever bars provider is configured — FMP or an IBKR gateway."""
+        if self.config.providers.bars == "ibkr":
+            return self.ibkr
         return self._get(
             "bars",
             lambda: FMPProvider(
@@ -126,6 +150,20 @@ class Providers:
                 timeout=self.config.providers.request_timeout,
             ),
         )
+
+    @property
+    def ibkr(self) -> IBKRProvider:
+        def build() -> IBKRProvider:
+            provider = IBKRProvider(
+                base_url=self.config.providers.ibkr_base_url,
+                fields=self.config.providers.ibkr_fields,
+                volume_multiplier=self.config.providers.ibkr_volume_multiplier,
+                timeout=self.config.providers.request_timeout,
+            )
+            provider.check_auth()
+            return provider
+
+        return self._get("ibkr", build)
 
     @property
     def uw(self) -> UnusualWhalesProvider:
@@ -165,14 +203,16 @@ def run(
     now: datetime | None = None,
     force: bool = False,
     providers: Providers | None = None,
+    canslim=None,
 ) -> RunResult:
     """One polling cycle.
 
-    `providers` is injectable so tests can drive the whole pipeline without a
-    network; production leaves it unset and gets lazily built real ones.
+    `providers` and `canslim` are injectable so tests can drive the whole
+    pipeline without a network; production leaves them unset.
     """
     now = now or datetime.now(timezone.utc)
     result = RunResult(started_at=now)
+    health = HealthTracker(state, unresponsive_after=int(config.run["unresponsive_after"]))
 
     open_now, why = cal.should_run(
         now.astimezone(cal.ET), extended_hours=bool(config.run["extended_hours"])
@@ -198,13 +238,16 @@ def run(
     try:
         for ticker in config.tickers:
             candidates.extend(
-                _process_ticker(config, state, providers, ticker, active, now, result)
+                _process_ticker(
+                    config, state, providers, health, ticker, active, now, result
+                )
             )
     finally:
         if owned:
             providers.close()
 
-    _deliver(config, state, notifier, candidates, result, now)
+    result.health_summary = health.summary_message()
+    _deliver(config, state, notifier, candidates, result, now, canslim)
 
     state.prune(now, int(config.run["state_retention_days"]))
     state.record_run(now, len(result.delivered), result.summary())
@@ -216,6 +259,7 @@ def _process_ticker(
     config: Config,
     state: State,
     providers: Providers,
+    health: HealthTracker,
     ticker: str,
     active: list[str],
     now: datetime,
@@ -229,36 +273,90 @@ def _process_ticker(
         cold_start_minutes=int(config.run["cold_start_lookback_minutes"]),
     )
 
+    def fetch(label: str, action):
+        """Run a provider call, turning failure into a health record."""
+        try:
+            value = action()
+        except SetupError as exc:
+            # Not ticker-specific — report it once for the whole run.
+            result.error(f"{label} unavailable: {exc}")
+            return None
+        except ProviderError as exc:
+            result.error(f"{ticker} {label}: {exc}")
+            health.record_failure(label, ticker, str(exc)[:160])
+            return None
+        health.record_success(label, ticker)
+        return value
+
     needs_bars = "volume_anomaly" in active
     wants_adv = any(
         name in active
         and float(config.detector(name, ticker).get("min_pct_of_adv", 0)) > 0
         for name in ("block_trades", "dark_pool")
     )
-    def fetch(label: str, action):
-        """Run a provider call, turning failure into a report rather than a stop."""
-        try:
-            return action()
-        except SetupError as exc:
-            # Not ticker-specific — report it once for the whole run.
-            result.error(f"{label} unavailable: {exc}")
-        except ProviderError as exc:
-            result.error(f"{ticker} {label}: {exc}")
-        return None
-
     if needs_bars or wants_adv:
-        interval = str(config.detector("volume_anomaly", ticker)["bar_interval"])
-        sessions = int(config.detector("volume_anomaly", ticker)["baseline_sessions"])
+        vol_settings = config.detector("volume_anomaly", ticker)
+        interval = str(vol_settings["bar_interval"])
+        sessions = int(vol_settings["baseline_sessions"])
         bars = fetch("bars", lambda: providers.bars.intraday_bars(ticker, interval))
         if bars is not None:
-            ctx.bars = bars
-            ctx.adv = providers.bars.average_daily_volume(bars, sessions)
+            clean, findings = inspect_bars(
+                ticker,
+                bars,
+                source="bars",
+                now=now,
+                interval_minutes=int(INTERVAL_MINUTES.get(interval, 5)),
+                max_stale_intervals=int(config.run["max_stale_intervals"]),
+            )
+            if findings:
+                health.record_findings(findings)
+                for finding in findings:
+                    ctx.note(f"{finding.state.value} bars — {finding.detail}")
+            else:
+                health.clear_findings("bars", ticker)
+            ctx.bars = clean
+            ctx.adv = providers.bars.average_daily_volume(clean, sessions)
 
     if {"block_trades", "dark_pool"} & set(active):
-        ctx.prints = fetch("prints", lambda: providers.uw.dark_pool_prints(ticker)) or []
+        prints = fetch("prints", lambda: providers.uw.dark_pool_prints(ticker))
+        if prints is not None:
+            findings = inspect_events(
+                ticker, "prints", [p.ts for p in prints], now=now
+            )
+            if findings:
+                health.record_findings(findings)
+                # Future-dated prints would evade every watermark, so drop them.
+                horizon = now
+                prints = [p for p in prints if p.ts <= horizon]
+            else:
+                health.clear_findings("prints", ticker)
+            ctx.prints = prints
 
     if "options_flow" in active:
-        ctx.option_trades = fetch("options flow", lambda: providers.uw.flow_alerts(ticker)) or []
+        flow = fetch("options flow", lambda: providers.uw.flow_alerts(ticker))
+        if flow is not None:
+            findings = inspect_events(ticker, "options flow", [f.ts for f in flow], now=now)
+            if findings:
+                health.record_findings(findings)
+                flow = [f for f in flow if f.ts <= now]
+            else:
+                health.clear_findings("options flow", ticker)
+            ctx.option_trades = flow
+
+    if "option_volume" in active:
+        snapshot = fetch(
+            "option volume", lambda: providers.ibkr.option_volume_ratio(ticker)
+        )
+        if snapshot is not None:
+            today, average, _ = snapshot
+            calls, puts = _call_put(providers, ticker)
+            ctx.option_volume = OptionVolumeSnapshot(
+                ticker=ticker,
+                today_volume=today,
+                average_volume=average,
+                call_volume=calls,
+                put_volume=puts,
+            )
 
     if "insider_trades" in active:
         ctx.insider_transactions = (
@@ -283,6 +381,15 @@ def _process_ticker(
 
     result.notes.extend(ctx.notes)
     return alerts
+
+
+def _call_put(providers: Providers, ticker: str) -> tuple[float | None, float | None]:
+    """Best-effort call/put split — the skew, when the gateway exposes it."""
+    try:
+        snap = providers.ibkr.snapshot(ticker)
+    except (ProviderError, SetupError):
+        return None, None
+    return snap.get("option_call_volume"), snap.get("option_put_volume")
 
 
 def _fetch_insider(
@@ -321,6 +428,7 @@ def _deliver(
     candidates: list[Alert],
     result: RunResult,
     now: datetime,
+    canslim=None,
 ) -> None:
     floor = Severity(str(config.run["min_severity"])).rank
     global_cap = int(config.run["max_alerts_per_run"])
@@ -339,15 +447,32 @@ def _deliver(
     fresh.sort(key=lambda a: (-a.severity.rank, -a.occurred_at.timestamp()))
     if len(fresh) > global_cap:
         result.capped = len(fresh) - global_cap
-        result.notes.append(
+        result.note(
             f"{result.capped} alert(s) dropped by run.max_alerts_per_run={global_cap}"
         )
         fresh = fresh[:global_cap]
 
+    grade_floor = Severity(str(config.run["canslim_min_severity"])).rank
+    want_grades = bool(config.run["attach_canslim"]) and canslim is not None
+
     failed_pairs: set[tuple[str, str]] = set()
     for alert in fresh:
-        if notifier.send(alert):
+        files: list[Path] = []
+        if want_grades and alert.severity.rank >= grade_floor:
+            files = _grade_files(canslim, alert, result, now)
+
+        if notifier.send(alert, files=files):
             state.mark_seen(alert.dedup_id, alert.detector, alert.ticker, now)
+            state.record_signal(
+                dedup_id=alert.dedup_id,
+                ticker=alert.ticker,
+                detector=alert.detector,
+                severity=alert.severity.value,
+                headline=alert.headline,
+                detail=_plain(alert.lines[0]) if alert.lines else "",
+                occurred_at=alert.occurred_at,
+                url=alert.url,
+            )
             result.delivered.append(alert)
         else:
             failed_pairs.add((alert.detector, alert.ticker))
@@ -362,6 +487,53 @@ def _deliver(
         notifier.send_summary(footer)
 
 
+def _grade_files(canslim, alert: Alert, result: RunResult, now: datetime) -> list[Path]:
+    """Grade the ticker and return the attachment, or nothing if it can't be done.
+
+    A missing report must never cost the alert it was going to be attached to,
+    so every failure here is recorded as a note and the alert goes out bare.
+    """
+    try:
+        outcome = canslim.grade(alert.ticker, now)
+    except Exception as exc:  # noqa: BLE001 - grading is a nicety, not the point
+        log.warning("CAN SLIM grading failed for %s: %s", alert.ticker, exc)
+        result.note(f"{alert.ticker}: CAN SLIM grading failed ({exc})")
+        return []
+
+    if not outcome.ok or outcome.report is None:
+        result.note(f"{alert.ticker}: no CAN SLIM report ({outcome.skipped})")
+        return []
+
+    report = outcome.report
+    if alert.ticker not in result.graded:
+        result.graded.append(alert.ticker)
+        alert.lines.append(
+            f"\n📄 <b>CAN SLIM: {html.escape(report.grade.verdict)}</b> "
+            f"({html.escape(report.grade.score_text)}) — "
+            f"{html.escape(report.grade.summary[:180])}"
+        )
+    else:
+        alert.lines.append(
+            f"\n📄 CAN SLIM: {html.escape(report.grade.one_line())} "
+            "<i>(graded earlier today)</i>"
+        )
+
+    if report.has_pdf and report.pdf_path:
+        return [report.pdf_path]
+    if report.pdf_error:
+        result.note(
+            f"{alert.ticker}: PDF export unavailable ({report.pdf_error[:100]}) — "
+            "sending the HTML report instead"
+        )
+    return [report.html_path]
+
+
+def _plain(text: str) -> str:
+    import re
+
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
 def _footer(config: Config, result: RunResult) -> str:
     """A quiet digest message, sent only when there is something to say.
 
@@ -370,6 +542,8 @@ def _footer(config: Config, result: RunResult) -> str:
     """
     esc = html.escape
     blocks: list[str] = []
+    if result.health_summary:
+        blocks.append(result.health_summary)
     if config.issues:
         blocks.append(
             "⚙️ <b>Config adjusted at runtime</b>\n"
@@ -380,7 +554,11 @@ def _footer(config: Config, result: RunResult) -> str:
             "⚠️ <b>Errors this run</b>\n"
             + "\n".join(f"• {esc(e)}" for e in result.errors[:10])
         )
-    notable = [n for n in result.notes if "suppressed" in n or "unavailable" in n]
+    notable = [
+        n
+        for n in result.notes
+        if any(word in n for word in ("suppressed", "unavailable", "stale", "corrupt", "failed"))
+    ]
     if notable:
         blocks.append(
             "ℹ️ <b>Notes</b>\n" + "\n".join(f"• {esc(n)}" for n in notable[:10])

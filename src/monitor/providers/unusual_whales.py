@@ -174,6 +174,11 @@ def _infer_side(price: float | None, bid: float | None, ask: float | None) -> Si
     if price is None or bid is None or ask is None or ask <= bid:
         return Side.UNKNOWN
     mid = (bid + ask) / 2.0
+    # A print priced nowhere near its quote means the quote is stale, mismatched
+    # or from another instrument. Inferring a side from it would be confident
+    # nonsense, so decline instead.
+    if mid <= 0 or abs(price - mid) / mid > 0.10:
+        return Side.UNKNOWN
     # A tenth of the spread of slack keeps midpoint crosses out of the buckets.
     tolerance = (ask - bid) * 0.1
     if price > mid + tolerance:

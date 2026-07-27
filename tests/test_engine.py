@@ -85,12 +85,14 @@ class RecordingNotifier:
     def __init__(self, fail: bool = False):
         self.alerts: list[Alert] = []
         self.summaries: list[str] = []
+        self.attachments: list = []
         self.fail = fail
 
-    def send(self, alert):
+    def send(self, alert, files=None):
         if self.fail:
             return False
         self.alerts.append(alert)
+        self.attachments.extend(files or [])
         return True
 
     def send_summary(self, text):

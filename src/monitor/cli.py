@@ -1,5 +1,8 @@
 """Command line interface.
 
+    monitor console             the bot's commands locally, no Telegram needed
+    monitor bot                 run the Telegram bot (long-polling)
+    monitor grade TICKER        CAN SLIM scorecard + PDF for one ticker
     monitor run                 one polling cycle (what the cron calls)
     monitor validate            strict config check — exit 1 on any problem
     monitor verify              live probe of every provider endpoint
@@ -20,6 +23,9 @@ from pathlib import Path
 
 from . import config as config_mod
 from . import engine
+from .bot.commands import BotContext
+from .canslim.service import CanSlimService
+from .runtime import Overlay
 from .models import Alert, Severity
 from .notify.base import ConsoleNotifier
 from .notify.telegram import TelegramNotifier
@@ -102,7 +108,113 @@ def _build_parser() -> argparse.ArgumentParser:
     state_p.add_argument("-s", "--state", default=DEFAULT_STATE)
     state_p.set_defaults(handler=cmd_state)
 
+    console_p = with_config(
+        sub.add_parser("console", help="the bot's commands locally, no Telegram")
+    )
+    console_p.add_argument("-s", "--state", default=DEFAULT_STATE)
+    console_p.add_argument(
+        "--script", default="", help='run semicolon-separated commands then exit'
+    )
+    console_p.add_argument("--no-colour", action="store_true")
+    console_p.set_defaults(handler=cmd_console)
+
+    bot_p = with_config(sub.add_parser("bot", help="run the Telegram bot"))
+    bot_p.add_argument("-s", "--state", default=DEFAULT_STATE)
+    bot_p.add_argument(
+        "--once", action="store_true", help="handle one batch of updates then exit"
+    )
+    bot_p.set_defaults(handler=cmd_bot)
+
+    grade_p = with_config(sub.add_parser("grade", help="CAN SLIM scorecard for a ticker"))
+    grade_p.add_argument("ticker")
+    grade_p.add_argument("--no-pdf", action="store_true", help="skip the PDF export")
+    grade_p.set_defaults(handler=cmd_grade)
+
     return parser
+
+
+DEFAULT_OVERLAY = "state/runtime.json"
+DEFAULT_REPORTS = "state/reports"
+
+
+def _bot_context(args: argparse.Namespace) -> BotContext:
+    """Assemble the shared context both front ends run on."""
+    overlay_path = Path(args.state).parent / "runtime.json"
+    overlay = Overlay.load(overlay_path)
+    cfg = config_mod.load(args.config, strict=False, overlay=overlay)
+    return BotContext(
+        config_path=Path(args.config),
+        state_path=Path(args.state),
+        overlay=overlay,
+        config=cfg,
+        canslim=_canslim(cfg),
+    )
+
+
+def _canslim(cfg: config_mod.Config, want_pdf: bool = True) -> CanSlimService:
+    return CanSlimService(
+        fmp_api_key=os.environ.get("FMP_API_KEY", ""),
+        fmp_base_url=cfg.providers.fmp_base_url,
+        cache_dir=os.environ.get("CANSLIM_REPORT_DIR", DEFAULT_REPORTS),
+        skill_path=os.environ.get("CANSLIM_SKILL_PATH") or None,
+        want_pdf=want_pdf,
+    )
+
+
+def cmd_console(args: argparse.Namespace) -> int:
+    from .bot.console import run_console
+
+    ctx = _bot_context(args)
+    for issue in ctx.config.issues:
+        logging.warning("config: %s: %s", issue.path, issue.message)
+    return run_console(ctx, script=args.script or None, colour=not args.no_colour)
+
+
+def cmd_bot(args: argparse.Namespace) -> int:
+    from .bot.telegram_bot import TelegramBot
+
+    ctx = _bot_context(args)
+    bot = TelegramBot(
+        token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+        chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+        ctx=ctx,
+    )
+    if args.once:
+        handled = bot.poll_once()
+        print(f"handled {handled} update(s)")
+        return 0
+    return bot.run_forever()
+
+
+def cmd_grade(args: argparse.Namespace) -> int:
+    cfg = config_mod.load(args.config, strict=False)
+    service = _canslim(cfg, want_pdf=not args.no_pdf)
+    outcome = service.grade(args.ticker.upper())
+    service.close()
+
+    if not outcome.ok:
+        print(f"could not grade {args.ticker.upper()}: {outcome.skipped}", file=sys.stderr)
+        return 1
+
+    report = outcome.report
+    assert report is not None
+    grade = report.grade
+    print(f"\n{grade.ticker} — {grade.company}")
+    print(f"  {grade.one_line()}")
+    print(f"  {grade.summary}\n")
+    for letter in grade.letters:
+        mark = {"pass": "PASS", "partial": "PART", "fail": "FAIL", "unknown": "????"}[letter.score]
+        print(f"  {letter.key}  {mark}  {letter.actual}")
+    print(f"\n  entry: {grade.entry}")
+    print(f"  stop:  {grade.stop}")
+    for warning in grade.warnings:
+        print(f"  ! {warning}")
+    print(f"\n  HTML: {report.html_path}")
+    if report.has_pdf:
+        print(f"  PDF:  {report.pdf_path}")
+    elif report.pdf_error:
+        print(f"  PDF:  not produced — {report.pdf_error}")
+    return 0
 
 
 # --------------------------------------------------------------------------

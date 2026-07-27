@@ -107,6 +107,36 @@ class OptionTrade:
 
 
 @dataclass(frozen=True)
+class OptionVolumeSnapshot:
+    """Chain-level option volume for an underlying, from IBKR.
+
+    Day-cumulative, so a ratio against the average only means something once
+    enough of the session has run — see the option_volume detector.
+    """
+
+    ticker: str
+    today_volume: float | None
+    average_volume: float | None
+    call_volume: float | None = None
+    put_volume: float | None = None
+
+    @property
+    def ratio(self) -> float | None:
+        if not self.today_volume or not self.average_volume:
+            return None
+        if self.average_volume <= 0:
+            return None
+        return self.today_volume / self.average_volume
+
+    @property
+    def call_put_skew(self) -> float | None:
+        """Calls per put. High means the activity is one-sided to the upside."""
+        if self.call_volume is None or not self.put_volume:
+            return None
+        return self.call_volume / self.put_volume
+
+
+@dataclass(frozen=True)
 class InsiderTransaction:
     """One non-derivative or derivative line off an SEC Form 4."""
 

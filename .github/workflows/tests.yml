@@ -25,8 +25,17 @@ jobs:
 
       - run: pip install -r requirements-dev.txt
 
+      # Optional: lets the CAN SLIM tests run instead of skipping.
+      - name: Fetch the CAN SLIM grader skill
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/thewongdirection/can-slim-grader \
+            vendor/can-slim-grader
+
       - name: Tests
         run: python -m pytest -q
+        env:
+          CANSLIM_SKILL_PATH: vendor/can-slim-grader
 
       # Catches a bad threshold or a stray key in the committed config before
       # the cron picks it up and quietly clamps it.

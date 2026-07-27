@@ -97,6 +97,20 @@ class FMPProvider:
 
         raise last_error or ProviderError(f"no FMP endpoint shape worked for {symbol}")
 
+    def daily_bars(self, symbol: str, years: float = 2.0) -> list[Bar]:
+        """Daily OHLCV — what the CAN SLIM technicals need, not intraday."""
+        today = datetime.now(ET).date()
+        start = today - timedelta(days=int(365 * years))
+        payload = self.http.get_json(
+            f"{self.base_url}/api/v3/historical-price-full/{symbol}",
+            params={
+                "from": start.isoformat(),
+                "to": today.isoformat(),
+                "apikey": self.api_key,
+            },
+        )
+        return _parse_bars(payload)
+
     def average_daily_volume(self, bars: list[Bar], sessions: int) -> float | None:
         """ADV derived from the intraday bars we already hold — no extra call."""
         by_day: dict[date, int] = {}

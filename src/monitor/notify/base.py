@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol, Sequence
 
 from ..models import Alert, Severity
@@ -14,6 +15,7 @@ SEVERITY_ICON = {
 
 DETECTOR_LABEL = {
     "volume_anomaly": "Unusual volume",
+    "option_volume": "Unusual option volume",
     "block_trades": "Block trade",
     "dark_pool": "Dark pool",
     "options_flow": "Options flow",
@@ -22,7 +24,7 @@ DETECTOR_LABEL = {
 
 
 class Notifier(Protocol):
-    def send(self, alert: Alert) -> bool: ...
+    def send(self, alert: Alert, files: Sequence[Path] | None = None) -> bool: ...
 
     def send_summary(self, text: str) -> bool: ...
 
@@ -32,8 +34,9 @@ class ConsoleNotifier:
 
     def __init__(self) -> None:
         self.sent: list[Alert] = []
+        self.attachments: list[Path] = []
 
-    def send(self, alert: Alert) -> bool:
+    def send(self, alert: Alert, files: Sequence[Path] | None = None) -> bool:
         icon = SEVERITY_ICON[alert.severity]
         label = DETECTOR_LABEL.get(alert.detector, alert.detector)
         print(f"\n{icon} [{alert.ticker}] {label}: {alert.headline}")
@@ -41,6 +44,9 @@ class ConsoleNotifier:
             print(f"   {_strip_tags(line)}")
         if alert.url:
             print(f"   {alert.url}")
+        for path in files or []:
+            print(f"   attachment: {path}")
+            self.attachments.append(Path(path))
         self.sent.append(alert)
         return True
 

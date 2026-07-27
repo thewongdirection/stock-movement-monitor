@@ -42,11 +42,21 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # The state database carries dedup keys and read watermarks. Cache keys
-      # must be unique to save, so this writes a per-run key and restores the
-      # newest previous one by prefix. Losing the cache is safe: the monitor
-      # falls back to run.cold_start_lookback_minutes rather than replaying a
-      # whole day of alerts.
+      # The CAN SLIM grader is a separate repo. Shallow-cloned each run so
+      # methodology changes are picked up; grading degrades gracefully if this
+      # step fails, so it must not fail the job.
+      - name: Fetch the CAN SLIM grader skill
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/thewongdirection/can-slim-grader \
+            vendor/can-slim-grader
+
+      # `state/` carries the dedup database, the bot's runtime overlay and the
+      # CAN SLIM report cache — a bot edit has to survive to the next tick.
+      # Cache keys must be unique to save, so this writes a per-run key and
+      # restores the newest previous one by prefix. Losing the cache is safe:
+      # the monitor falls back to run.cold_start_lookback_minutes rather than
+      # replaying a whole day of alerts.
       - name: Restore state
         id: restore
         uses: actions/cache/restore@v4
@@ -73,6 +83,7 @@ jobs:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           UW_API_KEY: ${{ secrets.UW_API_KEY }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          CANSLIM_SKILL_PATH: vendor/can-slim-grader
 
       # Saved even when the poll step failed, so a transient provider outage
       # does not also cost us the dedup table.

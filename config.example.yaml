@@ -19,11 +19,12 @@ tickers:
 # ---------------------------------------------------------------------------
 # Which signals to run. Each is independent — turn any of them off.
 #
-#   volume_anomaly  L1     abnormal volume on aggregated bars       (needs FMP)
-#   block_trades    L2     individual large prints                  (needs UW)
-#   dark_pool       L2     off-exchange prints by value / %ADV      (needs UW)
-#   options_flow    L3     unusual options premium                  (needs UW)
-#   insider_trades  Form 4 SEC filings                              (free)
+#   volume_anomaly  L1       abnormal volume on aggregated bars     (needs FMP or IBKR)
+#   block_trades    L2       individual large prints                (needs UW)
+#   dark_pool       L2       off-exchange prints by value / %ADV    (needs UW)
+#   options_flow    L3       unusual options premium                (needs UW)
+#   option_volume   L3-lite  whole-chain option volume vs average   (needs IBKR gateway)
+#   insider_trades  Form 4   SEC filings                            (free)
 #
 # Note: with Unusual Whales as the trades provider, block_trades and dark_pool
 # read the same off-exchange print stream and differ only in how they threshold
@@ -71,6 +72,17 @@ detectors:
     exclude_deep_itm_pct: 20.0
     cooldown_minutes: 15
 
+  # ---- L3-lite ------------------------------------------------------------
+  # Coarser than options_flow — no strike, premium or direction, just "the whole
+  # chain is busier than normal". Costs nothing extra if you already run an IBKR
+  # gateway. Off by default because it needs one.
+  option_volume:
+    enabled: false
+    min_ratio: 2.5            # pace-adjusted for how much of the session has run
+    min_contracts: 5000
+    min_session_pct: 20.0     # these are day-cumulative figures; wait for a base
+    cooldown_minutes: 240
+
   # ---- Form 4 -------------------------------------------------------------
   insider_trades:
     enabled: true
@@ -104,6 +116,15 @@ run:
   min_severity: low               # low | medium | high
   state_retention_days: 30
 
+  # Data source health
+  unresponsive_after: 3           # consecutive failures before reporting an outage
+  max_stale_intervals: 4          # bar intervals behind before the feed is "frozen"
+
+  # CAN SLIM scorecards attached to alerts. Graded once per ticker per day and
+  # reused, so a busy name costs one grade rather than one per alert.
+  attach_canslim: true
+  canslim_min_severity: medium    # don't grade every low-severity alert
+
 # ---------------------------------------------------------------------------
 # Providers
 #
@@ -113,9 +134,10 @@ run:
 # is needed.
 # ---------------------------------------------------------------------------
 providers:
-  bars: fmp
+  bars: fmp                 # fmp | ibkr
   trades: unusual_whales
   flow: unusual_whales
+  option_volume: ibkr
   insider: sec_edgar
   request_timeout: 30
 
@@ -128,6 +150,18 @@ providers:
       ticker_flow_alerts: /api/stock/{ticker}/flow-alerts
       stock_ohlc: /api/stock/{ticker}/ohlc/{interval}
       stock_info: /api/stock/{ticker}/info
+
+  # Interactive Brokers — finer bars (30-second), a real dollar ADV, and the
+  # option-volume signal. IBKR has NO API key: it needs a Client Portal Gateway
+  # running and interactively logged in, with a session that expires about daily.
+  # That works on a machine you control; it CANNOT work on a GitHub Actions
+  # runner, so leave base_url empty when running on the cron.
+  ibkr:
+    base_url: ""            # e.g. https://localhost:5000
+    history_volume_multiplier: 100   # CP history quotes stock volume in lots of 100
+    # Market-data field ids shift between gateway builds. `monitor verify`
+    # reports which ones answered; correct them here rather than in code.
+    fields: {}
 
   sec:
     # SEC's fair-access policy requires a real contact address here.

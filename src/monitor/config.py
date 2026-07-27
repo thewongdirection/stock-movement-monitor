@@ -241,6 +241,38 @@ OPTIONS_FLOW = {
 }
 
 # --------------------------------------------------------------------------
+# L3-lite — chain-level option volume (IBKR, no options-flow subscription)
+# --------------------------------------------------------------------------
+OPTION_VOLUME = {
+    "enabled": Param(False, kind="bool", doc="Turn this detector on or off. Needs an IBKR gateway."),
+    "min_ratio": Param(
+        2.5,
+        lo=1.2,
+        hi=25.0,
+        doc="Today's option volume divided by its average, pace-adjusted for how "
+        "much of the session has elapsed. 2-3x is the usual 'unusual activity' line.",
+    ),
+    "min_contracts": Param(
+        5_000,
+        lo=100,
+        hi=100_000_000,
+        doc="Ignore names whose whole chain is too thin for a ratio to mean anything.",
+    ),
+    "min_session_pct": Param(
+        20.0,
+        lo=5.0,
+        hi=100.0,
+        doc="Wait until this much of the session has elapsed. These are "
+        "day-cumulative figures, so an early-morning comparison against a "
+        "full-day average is noise.",
+    ),
+    "cooldown_minutes": Param(240, lo=0, hi=1440, kind="int", doc="Per-ticker silence window."),
+    "max_alerts_per_run": Param(
+        1, lo=1, hi=5, kind="int", doc="It is one cumulative daily fact; once is enough."
+    ),
+}
+
+# --------------------------------------------------------------------------
 # Insider trades — SEC Form 4
 # --------------------------------------------------------------------------
 INSIDER_TRADES = {
@@ -314,6 +346,7 @@ DETECTOR_SPECS: dict[str, dict[str, Param]] = {
     "block_trades": BLOCK_TRADES,
     "dark_pool": DARK_POOL,
     "options_flow": OPTIONS_FLOW,
+    "option_volume": OPTION_VOLUME,
     "insider_trades": INSIDER_TRADES,
 }
 
@@ -323,6 +356,7 @@ DETECTOR_LEVEL = {
     "block_trades": "L2",
     "dark_pool": "L2",
     "options_flow": "L3",
+    "option_volume": "L3-lite",
     "insider_trades": "Form 4",
 }
 
@@ -356,6 +390,36 @@ RUN_SPECS = {
     "state_retention_days": Param(
         30, lo=2, hi=365, kind="int", doc="How long dedup keys are kept."
     ),
+    "unresponsive_after": Param(
+        3,
+        lo=1,
+        hi=10,
+        kind="int",
+        doc="Consecutive failed calls to one data source before it is reported "
+        "as down. One blip is not an outage.",
+    ),
+    "max_stale_intervals": Param(
+        4,
+        lo=2,
+        hi=50,
+        kind="int",
+        doc="How many bar intervals behind the newest bar may fall during a "
+        "session before the feed is called stale. A frozen feed looks healthy "
+        "from the outside, so this is the check that catches it.",
+    ),
+    "attach_canslim": Param(
+        True,
+        kind="bool",
+        doc="Attach a CAN SLIM scorecard PDF to alerts. Graded once per ticker "
+        "per day and reused, so a busy name costs one grade, not one per alert.",
+    ),
+    "canslim_min_severity": Param(
+        "medium",
+        choices=("low", "medium", "high"),
+        kind="str",
+        doc="Only attach a scorecard to alerts at or above this severity — "
+        "grading every low-severity alert is rarely worth the calls.",
+    ),
 }
 
 # Unusual Whales REST paths. Kept in config because their published docs are
@@ -378,12 +442,18 @@ class ProviderConfig:
     bars: str = "fmp"
     trades: str = "unusual_whales"
     flow: str = "unusual_whales"
+    option_volume: str = "ibkr"
     insider: str = "sec_edgar"
     uw_base_url: str = "https://api.unusualwhales.com"
     uw_paths: dict[str, str] = field(default_factory=lambda: dict(UW_DEFAULT_PATHS))
     fmp_base_url: str = "https://financialmodelingprep.com"
     sec_user_agent: str = ""
     request_timeout: int = 30
+    #: Client Portal Gateway URL. Empty disables IBKR — it needs a running,
+    #: interactively-authenticated gateway, so it cannot work on CI runners.
+    ibkr_base_url: str = ""
+    ibkr_fields: dict[str, str] = field(default_factory=dict)
+    ibkr_volume_multiplier: int = 100
 
 
 @dataclass
@@ -394,6 +464,9 @@ class Config:
     providers: ProviderConfig
     overrides: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
     issues: list[Issue] = field(default_factory=list)
+    #: The watchlist as committed in config.yaml, before any runtime overlay.
+    #: The bot needs this to tell "remove a YAML ticker" from "undo an add".
+    baseline_tickers: list[str] = field(default_factory=list)
 
     def detector(self, name: str, ticker: str | None = None) -> dict[str, Any]:
         """Settings for a detector, with any per-ticker override applied."""
@@ -412,11 +485,14 @@ class Config:
             "bars": {"volume_anomaly"},
             "trades": {"block_trades", "dark_pool"},
             "flow": {"options_flow"},
+            "option_volume": {"option_volume"},
             "insider": {"insider_trades"},
         }[provider_role])
 
 
-def load(path: str | Path, strict: bool = False) -> Config:
+def load(
+    path: str | Path, strict: bool = False, overlay: Any | None = None
+) -> Config:
     raw_path = Path(path)
     if not raw_path.exists():
         raise ConfigError(
@@ -426,13 +502,28 @@ def load(path: str | Path, strict: bool = False) -> Config:
     data = yaml.safe_load(raw_path.read_text()) or {}
     if not isinstance(data, dict):
         raise ConfigError(f"{raw_path} must contain a YAML mapping at the top level.")
-    return from_dict(data, strict=strict)
+    return from_dict(data, strict=strict, overlay=overlay)
 
 
-def from_dict(data: dict[str, Any], strict: bool = False) -> Config:
+def from_dict(
+    data: dict[str, Any], strict: bool = False, overlay: Any | None = None
+) -> Config:
+    """Build a Config, optionally merging a runtime overlay over the baseline.
+
+    The overlay is merged into the *raw* mapping before validation, so a
+    bot-applied threshold is checked by exactly the same code path as one typed
+    into the YAML. `overlay` is duck-typed (a `runtime.Overlay`) to keep this
+    module free of a circular import.
+    """
     issues: list[Issue] = []
 
-    tickers = _clean_tickers(data.get("tickers"), issues)
+    baseline_tickers = _clean_tickers(data.get("tickers"), issues)
+    tickers = baseline_tickers
+    if overlay is not None:
+        data = _merge_overlay(data, overlay)
+        tickers = _clean_tickers(
+            overlay.effective_tickers(baseline_tickers), issues
+        )
 
     detectors: dict[str, dict[str, Any]] = {}
     supplied_detectors = data.get("detectors") or {}
@@ -471,7 +562,31 @@ def from_dict(data: dict[str, Any], strict: bool = False) -> Config:
         providers=providers,
         overrides=overrides,
         issues=issues,
+        baseline_tickers=baseline_tickers,
     )
+
+
+def _merge_overlay(data: dict[str, Any], overlay: Any) -> dict[str, Any]:
+    """Layer the overlay's detector, run and per-ticker edits over the raw YAML."""
+    merged = dict(data)
+
+    detectors = {k: dict(v or {}) for k, v in (merged.get("detectors") or {}).items()}
+    for name, settings in (overlay.detectors or {}).items():
+        detectors.setdefault(name, {}).update(settings)
+    merged["detectors"] = detectors
+
+    merged["run"] = {**(merged.get("run") or {}), **(overlay.run or {})}
+
+    overrides = {
+        k: {d: dict(s or {}) for d, s in (v or {}).items()}
+        for k, v in (merged.get("overrides") or {}).items()
+    }
+    for ticker, per_detector in (overlay.per_ticker or {}).items():
+        target = overrides.setdefault(ticker.upper(), {})
+        for detector, settings in per_detector.items():
+            target.setdefault(detector, {}).update(settings)
+    merged["overrides"] = overrides
+    return merged
 
 
 def _apply_presets(
@@ -547,9 +662,10 @@ def _clean_overrides(
 def _provider_config(value: dict[str, Any], issues: list[Issue]) -> ProviderConfig:
     cfg = ProviderConfig()
     roles = {
-        "bars": ("fmp", "unusual_whales"),
+        "bars": ("fmp", "ibkr"),
         "trades": ("unusual_whales",),
         "flow": ("unusual_whales",),
+        "option_volume": ("ibkr",),
         "insider": ("sec_edgar",),
     }
     for role, allowed in roles.items():
@@ -585,6 +701,24 @@ def _provider_config(value: dict[str, Any], issues: list[Issue]) -> ProviderConf
     fmp = value.get("fmp") or {}
     if isinstance(fmp, dict):
         cfg.fmp_base_url = str(fmp.get("base_url", cfg.fmp_base_url)).rstrip("/")
+
+    ibkr = value.get("ibkr") or {}
+    if isinstance(ibkr, dict):
+        cfg.ibkr_base_url = str(ibkr.get("base_url", "") or "").rstrip("/")
+        fields = ibkr.get("fields") or {}
+        if isinstance(fields, dict):
+            cfg.ibkr_fields = {str(k): str(v) for k, v in fields.items()}
+        multiplier = ibkr.get("history_volume_multiplier")
+        if multiplier is not None:
+            try:
+                cfg.ibkr_volume_multiplier = max(1, int(multiplier))
+            except (TypeError, ValueError):
+                issues.append(
+                    Issue(
+                        "providers.ibkr.history_volume_multiplier",
+                        "expected an integer (100 for lot-quoted history, 1 for shares)",
+                    )
+                )
 
     sec = value.get("sec") or {}
     if isinstance(sec, dict):

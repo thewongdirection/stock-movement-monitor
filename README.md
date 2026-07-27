@@ -4,18 +4,24 @@ Telegram alerts for unusually large trades, unusual options flow, and insider
 filings on a watchlist you define. Runs as a GitHub Actions cron — no server to
 keep alive.
 
-Four independent detectors, each switchable and tunable:
+Six independent detectors, each switchable and tunable:
 
 | | Detector | What it catches | Data source |
 |---|---|---|---|
-| **L1** | `volume_anomaly` | Abnormal volume on 1/5/15-minute bars, normalised by time of day | FMP |
+| **L1** | `volume_anomaly` | Abnormal volume on 30s/1/5/15-minute bars, normalised by time of day | FMP or IBKR |
 | **L2** | `block_trades` | Individual large prints, sized in shares | Unusual Whales |
 | **L2** | `dark_pool` | Off-exchange prints, sized in dollars and % of ADV | Unusual Whales |
 | **L3** | `options_flow` | Whale premium, sweeps, volume-over-open-interest | Unusual Whales |
+| **L3-lite** | `option_volume` | Whole-chain option volume vs its average | IBKR (no options feed needed) |
 | | `insider_trades` | SEC Form 4 purchases and sales, cluster buys | SEC EDGAR (free) |
 
 Typical latency is one cron interval — about 5 minutes, occasionally 20 when
 GitHub's scheduler is busy. Comfortably inside a 2-hour target.
+
+You control it from Telegram — list and edit the watchlist, pull a ticker's
+14-day signal history, request a CAN SLIM scorecard, and change any threshold or
+switch any level on and off. **`monitor console` gives you that whole surface
+locally, with no bot token**, so you can try it before setting anything up.
 
 ---
 
@@ -40,6 +46,32 @@ off-exchange. You do not learn *which* pool — FINRA publishes per-ATS detail
 weekly, with a multi-week lag.
 
 ---
+
+## Try it without Telegram
+
+```bash
+pip install -r requirements.txt
+PYTHONPATH=src python -m monitor console
+```
+
+Same router, same handlers, same replies as the bot — only the transport
+differs. Config edits are real and persist. Buttons become numbered choices.
+
+```
+> list                      watchlist with 14-day signal counts
+> add PLTR CRWD             start watching
+> levels                    which detection levels are on
+> set dark_pool min_notional 2.5M
+> set TSLA volume_anomaly rvol_threshold 4
+> config volume_anomaly     current thresholds and their allowed ranges
+> explain volume_anomaly    what each setting does and why
+> history NVDA              signals in the last 14 days
+> grade NVDA                CAN SLIM scorecard + PDF
+> changes                   what differs from config.yaml
+> status                    market state, health, last run
+```
+
+Or non-interactively: `monitor console --script "list; add PLTR; levels"`.
 
 ## Setup
 
@@ -72,9 +104,32 @@ SEC's fair-access policy requires it, and the monitor refuses to call EDGAR
 with the shipped example value.
 
 If you only want insider alerts, you need no paid keys at all: set
-`enabled: false` on the other four detectors.
+`enabled: false` on every other detector.
 
 Add all five under **Settings → Secrets and variables → Actions**.
+
+### 2b. Optional: CAN SLIM scorecards
+
+Alerts can carry a CAN SLIM PDF for the name that triggered them:
+
+```bash
+git clone --depth 1 https://github.com/thewongdirection/can-slim-grader vendor/can-slim-grader
+```
+
+Read [what this actually grades](#can-slim-scorecards) before relying on it —
+the letters are scored programmatically against the skill's published rubric,
+which is not the same thing as the skill's own agent judgement.
+
+### 2c. Optional: Interactive Brokers
+
+IBKR buys you finer bars (30-second), a genuine 90-day *dollar* ADV, and the
+`option_volume` signal. What it does **not** buy is individual block or dark-pool
+prints — see [IBKR's limits](#what-ibkr-can-and-cannot-do).
+
+The catch is operational: **IBKR has no API key.** It needs a Client Portal
+Gateway running and interactively logged in, with a session that expires roughly
+daily. That works on a machine you control. It cannot work on a GitHub Actions
+runner, so on the cron leave `providers.ibkr.base_url` empty and use FMP.
 
 ### 3. Watchlist
 
@@ -184,9 +239,43 @@ by default; `block_trades` is off.
 
 ---
 
+## Controlling it from Telegram
+
+`monitor bot` runs a long-polling bot. Long polling rather than webhooks because
+webhooks need a public HTTPS endpoint, and the whole premise here is not running
+a server. The consequence: **the cron sends alerts on its own, but interactive
+commands only work while `monitor bot` is running.** Start it when you want to
+change something, or keep it up on a small always-on box.
+
+Only the configured chat is served — the bot token is a bearer credential, and
+anyone holding it could otherwise edit your watchlist.
+
+| Command | Does |
+|---|---|
+| `/list` | Watchlist with 14-day signal counts; tap a ticker for its history |
+| `/add NVDA` · `/remove NVDA` | Edit the watchlist |
+| `/history NVDA [days]` | Signals recorded for that name, newest first |
+| `/grade NVDA` | CAN SLIM scorecard, PDF attached |
+| `/levels` · `/on X` · `/off X` | Which detection levels run |
+| `/config [X]` · `/set X SETTING VALUE` | Read and change thresholds |
+| `/set TSLA X SETTING VALUE` | Change one setting for one ticker |
+| `/explain X` | Every setting, its allowed range, and the reasoning |
+| `/reset [X]` · `/changes` | Back to committed defaults; see the live diff |
+| `/status` | Market state, data-source health, last run |
+
+Edits land in `state/runtime.json`, an overlay merged over `config.yaml` at load
+time. So `config.yaml` stays the reviewable baseline, a bad live change is one
+`/reset` away, and the edit survives to the next cron tick without a commit.
+Bot edits go through the same bounded validation as the YAML — `/set
+volume_anomaly rvol_threshold 500` is refused with the allowed range, not
+silently clamped. `2.5M`, `500k` and `1,250,000` all work.
+
 ## Commands
 
 ```
+monitor console             the bot's commands locally, no Telegram needed
+monitor bot                 run the Telegram bot (long-polling)
+monitor grade TICKER        CAN SLIM scorecard + PDF for one ticker
 monitor run                 one polling cycle (what the cron calls)
   --dry-run                 print alerts instead of sending; leaves state untouched
   --force                   run session-bound detectors even when the market is closed
@@ -232,6 +321,75 @@ workflows in a repository with no activity for 60 days.
 
 ---
 
+## What IBKR can and cannot do
+
+**Can — aggregate volume, well.** Bars down to 30 seconds (finer than FMP's
+1-minute floor), a real 90-day average dollar volume, 52-week statistics, and
+today's option volume for the underlying against its average. That last one is a
+genuine unusual-activity read you get *without* an options-flow subscription,
+which is why `option_volume` exists as a detector.
+
+**Cannot — individual large prints, through this API.** Tick-by-tick trade data
+does exist in IBKR's native TWS API (`reqTickByTickData` with "AllLast"), but
+that is a socket protocol against a running TWS instance, not REST. So L2 print
+detection still comes from Unusual Whales. If you wanted IBKR to do L2, you'd be
+building the always-on process this project was designed to avoid.
+
+**`option_volume` is genuinely coarser than `options_flow`.** It says "the whole
+chain is 3× busier than normal, skewed to calls". It does not say who bought
+what strike for how much. Read it as confirmation, and check for an earnings date
+before reading anything into it — elevated chain volume into earnings is routine.
+The figures are day-cumulative, so the ratio is pace-adjusted for how much of the
+session has elapsed and suppressed entirely before `min_session_pct`.
+
+## CAN SLIM scorecards
+
+Attached to alerts at or above `run.canslim_min_severity`, and available on
+demand with `/grade NVDA`.
+
+**Be clear on what this is.** `can-slim-grader` is an *agent* skill: its intended
+operator is an LLM that reads the methodology, gathers data, and exercises
+judgement per letter. A five-minute cron has no LLM in the loop, so this
+implements the skill's **published pass/partial/fail rubric deterministically** —
+the thresholds from its `data-and-scoring-guide.md`, applied in code.
+
+- **What that buys:** free, fast, reproducible, runnable on every alert.
+- **What it costs:** the letters that genuinely need judgement — chiefly **N**'s
+  "new product/management/condition" story and the quality half of **I** —
+  cannot be assessed from numbers. Those are scored on their measurable proxies
+  and the report *says so per letter*, rather than implying a judgement it never
+  made. A letter with no data reads `unknown`, never `fail`.
+
+Three parts of the skill are used **verbatim**: `relative_strength.py` for the
+technicals, `evaluation_template.html` for the report, `html_to_pdf.py` for the
+export. Only the letter-scoring loop is local.
+
+Grades are computed **once per ticker per day** and reused — a CAN SLIM verdict
+turns on quarterly earnings and a multi-month base, so ten alerts on one busy
+name cost one grade. If no PDF engine is present the HTML report is attached
+instead; a missing report never costs you the alert.
+
+## Data source health
+
+A monitor that silently stops seeing data is worse than no monitor, because
+silence reads as "nothing is happening". Three distinct failures, three checks:
+
+| Failure | How it's caught | When you hear about it |
+|---|---|---|
+| **Unresponsive** | the call raises or times out | after `unresponsive_after` consecutive misses (default 3), then once — not every 5 minutes |
+| **Stale** | bar timestamps compared against the session clock | when the newest bar falls more than `max_stale_intervals` behind during a session |
+| **Corrupt** | negative volume, non-positive prices, high&nbsp;<&nbsp;low, OHLC out of range, out-of-order or duplicate timestamps, implausible intraday jumps | immediately |
+
+Stale is the dangerous one: the call *succeeds*, so a frozen feed looks perfectly
+healthy from outside. Corrupt is escalated immediately rather than after N
+occurrences, because a corrupt bar produces a confident, completely false alert —
+so corrupt bars are **dropped before any detector sees them**. An unadjusted
+10-for-1 split is caught this way instead of being reported as a -90% move.
+Recovery is announced too, so you know when to trust a feed again. `/status`
+shows current health; the run footer reports changes.
+
+---
+
 ## Known limitations
 
 - **Unusual Whales endpoint paths are unverified** against their spec, for the
@@ -247,6 +405,12 @@ workflows in a repository with no activity for 60 days.
 - **The market calendar is hardcoded** through 2028 (`market_calendar.py`). Past
   that it falls back to weekday logic and says so in the run log — it fails open
   rather than deciding the market is shut.
+- **Interactive commands need `monitor bot` running.** The cron alerts on its
+  own; the bot only answers while its process is up. That's the cost of long
+  polling instead of a public webhook endpoint.
+- **IBKR needs a logged-in gateway** and cannot run on CI, as above.
+- **CAN SLIM letters are scored programmatically**, not by the skill's own agent
+  judgement, as above.
 - **Not investment advice, and not a trading signal.** Unusual size is a
   prompt to go look, nothing more.
 
@@ -254,9 +418,24 @@ workflows in a repository with no activity for 60 days.
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q          # 159 tests, no network needed
+python -m pytest -q          # 380 tests, no network needed
 ```
 
-Tests run against fixtures throughout — provider payload parsing, the detection
-logic, config bounds, state transitions and the full engine pipeline with stub
+No network anywhere in the suite. Coverage spans provider payload parsing,
+detection logic, config bounds, state transitions, health escalation, the bot
+command surface, CAN SLIM scoring, and the full engine pipeline with stub
 providers.
+
+Two deliberate choices in the test design:
+
+- **Ten ticker profiles**, not one synthetic mega-cap (`tests/tickers.py`) —
+  mega-cap, high-beta, mid, small, a $3.70 stock, a $742,000 stock, and an
+  illiquid micro-cap. Logic tuned on one price scale misbehaves on another: the
+  low-priced and ultra-high-priced profiles exist specifically to pin the cases
+  where share-count and dollar thresholds disagree.
+- **Fixtures are seeded with `zlib.crc32`, not `hash()`** — Python randomises
+  string hashing per process, so seeding from `hash()` produces tests that pass
+  locally and fail in CI on an unlucky seed. Ask how I know.
+
+CAN SLIM tests skip cleanly when the skill isn't checked out, so CI doesn't fail
+on an absent optional sibling repo.

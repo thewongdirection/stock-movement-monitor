@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
+from typing import Sequence
 
 import requests
 
@@ -38,12 +40,44 @@ class TelegramNotifier:
         self._last_send = 0.0
         self.failures: list[str] = []
 
-    def send(self, alert: Alert) -> bool:
+    def send(self, alert: Alert, files: Sequence[Path] | None = None) -> bool:
         silent = alert.severity is Severity.LOW
         ok = True
         for part in chunk(format_alert(alert)):
             ok = self._post(part, silent=silent, preview=bool(alert.url)) and ok
+        # Attachments follow the message. A failed upload does not fail the
+        # alert — the text carries the finding; the report is supporting detail.
+        for path in files or []:
+            self._send_document(Path(path), silent=silent)
         return ok
+
+    def _send_document(self, path: Path, silent: bool = False) -> bool:
+        if not path.exists():
+            log.warning("attachment missing, skipping: %s", path)
+            return False
+        self._space_out()
+        try:
+            with path.open("rb") as handle:
+                response = self.session.post(
+                    f"{API}/bot{self.token}/sendDocument",
+                    data={
+                        "chat_id": self.chat_id,
+                        "caption": path.name,
+                        "disable_notification": silent,
+                    },
+                    files={"document": (path.name, handle)},
+                    timeout=max(self.timeout, 120),
+                )
+        except (requests.RequestException, OSError) as exc:
+            self.failures.append(f"attachment {path.name}: {exc}")
+            log.error("could not upload %s: %s", path, exc)
+            return False
+        if not response.ok:
+            detail = _describe(response)
+            self.failures.append(f"attachment {path.name}: {detail}")
+            log.error("sendDocument failed for %s: %s", path, detail)
+            return False
+        return True
 
     def send_summary(self, text: str) -> bool:
         return all(self._post(part, silent=True, preview=False) for part in chunk(text))

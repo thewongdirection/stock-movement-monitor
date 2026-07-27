@@ -12,3 +12,6 @@ venv/
 state/
 *.db
 *.db-journal
+
+# CAN SLIM skill, cloned by the workflow (and locally for development)
+vendor/
