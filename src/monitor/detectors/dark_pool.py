@@ -18,6 +18,7 @@ from datetime import datetime
 from ..models import Alert, Severity
 from .base import Context, Detector, combine_ok, escalate, money, shares
 from .block_trades import _print_key, _side_line
+from .reads import dark_pool_read
 
 
 class DarkPoolDetector(Detector):
@@ -101,6 +102,7 @@ class DarkPoolDetector(Detector):
                     headline=f"Dark pool print — {money(print_.notional)}",
                     occurred_at=print_.ts,
                     lines=lines,
+                    read=dark_pool_read(adv_share, print_.notional),
                     dedup_parts=(key,),
                 )
             )

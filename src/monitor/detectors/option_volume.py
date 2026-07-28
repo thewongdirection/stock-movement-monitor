@@ -22,6 +22,7 @@ from __future__ import annotations
 from .. import market_calendar as cal
 from ..models import Alert, Severity
 from .base import Context, Detector, escalate
+from .reads import option_volume_read
 
 
 class OptionVolumeDetector(Detector):
@@ -94,6 +95,7 @@ class OptionVolumeDetector(Detector):
                     headline=f"Unusual option volume — {projected_ratio:.1f}× normal",
                     occurred_at=ctx.now,
                     lines=lines,
+                    read=option_volume_read(projected_ratio, skew),
                     # One per ticker per session: it's a cumulative daily figure,
                     # so re-alerting as it climbs would just be the same fact.
                     dedup_parts=(ctx.now.astimezone(cal.ET).date().isoformat(),),

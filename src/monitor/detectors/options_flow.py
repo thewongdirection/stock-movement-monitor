@@ -24,6 +24,7 @@ from datetime import datetime
 
 from ..models import Alert, OptionTrade, Severity, Side
 from .base import Context, Detector, esc, escalate, money
+from .reads import options_flow_read
 
 
 class OptionsFlowDetector(Detector):
@@ -153,6 +154,14 @@ def _build_alert(
         headline=f"Options flow — {money(trade.premium)} {kind}",
         occurred_at=trade.ts,
         lines=lines,
+        read=options_flow_read(
+            kind,
+            trade.moneyness_pct,
+            dte,
+            (trade.volume / trade.open_interest)
+            if trade.volume and trade.open_interest
+            else None,
+        ),
         dedup_parts=(
             trade.raw_id
             or f"{trade.ts.isoformat()}|{kind}|{trade.strike}|{trade.expiry}|{trade.premium:.0f}",

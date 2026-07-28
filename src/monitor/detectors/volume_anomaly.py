@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 
 from .. import market_calendar as cal
 from ..models import Alert, Bar, Severity
+from .reads import volume_read
 from .base import Context, Detector, combine_ok, escalate, money, shares
 
 INTERVAL_MINUTES = {"1min": 1, "5min": 5, "15min": 15, "30min": 30}
@@ -161,6 +162,7 @@ class VolumeAnomalyDetector(Detector):
             headline=f"Unusual volume — {rvol:.1f}× normal",
             occurred_at=bar.ts,
             lines=lines,
+            read=volume_read(move_pct, rvol),
             dedup_parts=(interval, bar.ts.isoformat()),
         )
 

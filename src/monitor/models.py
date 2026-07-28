@@ -198,6 +198,14 @@ class Alert:
     lines: list[str] = field(default_factory=list)
     url: str | None = None
     dedup_parts: tuple[str, ...] = ()
+    #: One line on what the signal is evidence of, and what to look at next.
+    #:
+    #: Deliberately not a recommendation. Several of these signals carry no
+    #: direction at all — a dark pool print has no side, and large call premium
+    #: may be a hedge — so "buy" or "sell" here would be a claim the data does
+    #: not support. Where direction *is* knowable (an insider sale, volume on a
+    #: down move) it is stated plainly; where it is not, that is stated too.
+    read: str = ""
 
     @property
     def dedup_id(self) -> str:

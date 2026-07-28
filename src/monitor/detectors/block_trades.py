@@ -19,6 +19,7 @@ from datetime import datetime
 
 from ..models import Alert, Severity, Side, Trade
 from .base import Context, Detector, combine_ok, esc, escalate, money, shares
+from .reads import block_read
 
 
 class BlockTradeDetector(Detector):
@@ -116,6 +117,7 @@ def _build_alert(
         headline=f"Large print — {money(print_.notional)}",
         occurred_at=print_.ts,
         lines=lines,
+        read=block_read(adv_share),
         dedup_parts=(_print_key(print_),),
     )
 

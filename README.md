@@ -32,6 +32,13 @@ locally, with no bot token**, so you can try it before setting anything up.
 
 ## Three things to know before you trust the output
 
+**0. Every alert ends with a one-line read.** A `➤` line saying what the signal is
+evidence of and what to look at next, below the measurements so you can tell
+observation from interpretation. It is deliberately not a recommendation — see
+[`detectors/reads.py`](src/monitor/detectors/reads.py), which is the one file to
+review when you disagree with a reading. Where the data cannot support a
+direction the read says so; where it can, it says that plainly.
+
 **1. The tape does not say who was buying.** US consolidated trade data carries
 price, size, venue and condition codes — but no aggressor flag. Every "buy" or
 "sell" label in this project is *inferred*, by comparing the print price to the

@@ -37,13 +37,12 @@ class ConsoleNotifier:
         self.attachments: list[Path] = []
 
     def send(self, alert: Alert, files: Sequence[Path] | None = None) -> bool:
-        icon = SEVERITY_ICON[alert.severity]
-        label = DETECTOR_LABEL.get(alert.detector, alert.detector)
-        print(f"\n{icon} [{alert.ticker}] {label}: {alert.headline}")
-        for line in alert.lines:
-            print(f"   {_strip_tags(line)}")
-        if alert.url:
-            print(f"   {alert.url}")
+        # Rendered through format_alert, not a second copy of the layout: a
+        # preview that can drift from the real message is worse than no preview.
+        # (It already had — the `read` line was missing here for a while.)
+        print()
+        for line in _strip_tags(format_alert(alert)).splitlines():
+            print(f"   {line}" if line else "")
         for path in files or []:
             print(f"   attachment: {path}")
             self.attachments.append(Path(path))
@@ -71,9 +70,12 @@ def format_alert(alert: Alert) -> str:
         f"<b>{alert.headline}</b>\n\n"
     )
     body = "\n".join(alert.lines)
+    # Set apart from the evidence above it. A reader should be able to tell at a
+    # glance which lines are measurements and which line is the interpretation.
+    read = f"\n\n➤ <b>{alert.read}</b>" if alert.read else ""
     tail = f'\n\n<a href="{alert.url}">View filing</a>' if alert.url else ""
     stamp = f"\n\n<i>{alert.occurred_at.astimezone():%Y-%m-%d %H:%M:%S %Z}</i>"
-    return head + body + tail + stamp
+    return head + body + read + tail + stamp
 
 
 def chunk(text: str, limit: int = 3800) -> Sequence[str]:

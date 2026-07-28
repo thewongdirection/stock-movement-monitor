@@ -27,6 +27,7 @@ from datetime import datetime
 from ..models import Alert, InsiderTransaction, Severity
 from ..providers.sec_edgar import category_for, label_for
 from .base import Context, Detector, esc, escalate, money, shares
+from .reads import insider_read
 
 SENIOR_TITLE_HINTS = (
     "chief executive",
@@ -174,6 +175,14 @@ def _build_alert(
         occurred_at=txn.filed_at,
         lines=lines,
         url=txn.url,
+        read=insider_read(
+            is_purchase=category == "purchase",
+            cluster_count=cluster_count,
+            cluster_min=cluster_min,
+            is_ten_pct_owner=txn.is_ten_pct_owner,
+            is_officer=txn.is_officer,
+            is_director=txn.is_director,
+        ),
         dedup_parts=(
             txn.accession,
             txn.transaction_code,
