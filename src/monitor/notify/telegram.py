@@ -15,6 +15,7 @@ from typing import Sequence
 import requests
 
 from ..models import Alert, Severity
+from ..params import ConfigError
 from .base import chunk, format_alert
 
 log = logging.getLogger(__name__)
@@ -27,11 +28,25 @@ SEND_SPACING = 1.1
 
 class TelegramNotifier:
     def __init__(self, token: str, chat_id: str, timeout: int = 20):
-        if not token or not chat_id:
-            raise ValueError(
-                "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must both be set. "
-                "Create a bot with @BotFather, message it once, then read your "
-                "chat id from `monitor telegram-chat-id`."
+        # ConfigError, not ValueError: the CLI catches this and prints one clean
+        # line. A bare ValueError escaped as a stack trace, which is a poor way
+        # for a tool built around legible failures to say "you forgot a secret".
+        missing = [
+            name
+            for name, value in (("TELEGRAM_BOT_TOKEN", token), ("TELEGRAM_CHAT_ID", chat_id))
+            if not value
+        ]
+        if missing:
+            raise ConfigError(
+                f"{' and '.join(missing)} "
+                f"{'is' if len(missing) == 1 else 'are'} not set, so there is nowhere "
+                "to send alerts.\n"
+                "  • Locally:  export TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...\n"
+                "  • On GitHub Actions:  Settings → Secrets and variables → Actions → "
+                "New repository secret\n"
+                "Get the token from @BotFather, message your new bot once, then run "
+                "`monitor telegram-chat-id` to read the chat id.\n"
+                "To run without sending anything, use `monitor run --dry-run`."
             )
         self.token = token
         self.chat_id = chat_id

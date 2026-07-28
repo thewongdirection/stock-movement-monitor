@@ -247,12 +247,20 @@ GitHub Actions. No server to keep alive.
 
 Once a dry run looks right, untick `dry_run` and let the schedule take over.
 
-**Two things to know about the cron:**
+**Three things to know about the cron:**
 
+- **Add the secrets before enabling the schedule.** Without
+  `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` the run has nowhere to send
+  alerts, so it exits non-zero and GitHub emails you a failure every time it
+  fires. That is deliberate — a monitor that cannot deliver is broken, and
+  should not look healthy — but it means an unconfigured repo will mail you
+  hourly until you either add the secrets or disable the workflow.
 - **GitHub disables scheduled workflows after 60 days of repo inactivity.** A
   commit or a manual run resets the clock.
-- **Its scheduler is best-effort** and often 5–20 minutes late under load. Fine
-  against a 2-hour target; not a design for sub-second alerting.
+- **`*/5` is a request, not a promise.** GitHub's scheduler is best-effort and
+  drops runs under load — on a quiet repo, a five-minute cron in practice fires
+  closer to hourly, and irregularly. Fine against a 2-hour target; if you need
+  reliable five-minute latency, run the cron somewhere you control.
 
 ---
 

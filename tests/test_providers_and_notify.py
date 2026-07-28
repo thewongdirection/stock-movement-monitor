@@ -321,3 +321,54 @@ def test_console_notifier_strips_markup_for_the_terminal(capsys):
     out = capsys.readouterr().out
     assert "<b>" not in out
     assert "bold & escaped" in out
+
+
+# --------------------------------------------------------------------------
+# Missing delivery credentials
+# --------------------------------------------------------------------------
+def test_missing_telegram_credentials_is_a_config_error_not_a_traceback():
+    """This shipped as a bare ValueError and reached CI as a stack trace.
+
+    `main()` catches ConfigError and prints one clean line; a ValueError escapes
+    it. For a tool built around legible failures, dumping a traceback to say
+    "you forgot a secret" is the wrong answer.
+    """
+    from monitor.notify.telegram import TelegramNotifier
+    from monitor.params import ConfigError
+
+    with pytest.raises(ConfigError) as exc:
+        TelegramNotifier(token="", chat_id="")
+    message = str(exc.value)
+    assert "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are not set" in message
+    assert "Secrets and variables" in message  # where to put them in CI
+    assert "--dry-run" in message  # how to run without them
+
+
+def test_the_error_names_only_the_credential_actually_missing():
+    from monitor.notify.telegram import TelegramNotifier
+    from monitor.params import ConfigError
+
+    with pytest.raises(ConfigError) as exc:
+        TelegramNotifier(token="123:abc", chat_id="")
+    assert "TELEGRAM_CHAT_ID is not set" in str(exc.value)
+    assert "TELEGRAM_BOT_TOKEN" not in str(exc.value).split("\n")[0]
+
+
+def test_the_cli_exits_cleanly_when_delivery_is_unconfigured(tmp_path, monkeypatch, capsys):
+    """A non-zero exit, but no traceback: the job fails loudly and legibly."""
+    from monitor import cli
+
+    for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        monkeypatch.delenv(name, raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("tickers: [NVDA]\n")
+
+    code = cli.main(
+        ["run", "-c", str(config_path), "--overlay", str(tmp_path / "o.json"),
+         "-s", str(tmp_path / "m.db")]
+    )
+    err = capsys.readouterr().err
+
+    assert code == 2
+    assert "config error:" in err
+    assert "Traceback" not in err
