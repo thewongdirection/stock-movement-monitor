@@ -110,13 +110,21 @@ Each key is optional and turns on specific detectors. Skip any you don't want.
 | Key | Cost | Turns on | Where |
 |---|---|---|---|
 | `SEC_USER_AGENT` | free | `insider_trades` — Form 4 buys and sells | just your own email |
-| `FMP_API_KEY` | free tier available | `volume_anomaly` (L1) and CAN SLIM scorecards | [financialmodelingprep.com](https://site.financialmodelingprep.com/developer/docs) |
+| `FMP_API_KEY` | **paid — Starter or above** | `volume_anomaly` (L1) and CAN SLIM scorecards | [financialmodelingprep.com](https://site.financialmodelingprep.com/developer/docs) |
 | `UW_API_KEY` | paid | `dark_pool`, `block_trades` (L2), `options_flow` (L3) | [unusualwhales.com](https://unusualwhales.com/settings/api-dashboard) |
 | `ANTHROPIC_API_KEY` | pay per use | Claude writing the CAN SLIM judgement letters | [console.anthropic.com](https://console.anthropic.com/) |
 
 `SEC_USER_AGENT` is not really a key — SEC's fair-access policy asks for a
 contact address that reaches you. Use the real thing; a fake one gets you
 blocked, and the monitor refuses to send the example value.
+
+**On the FMP tier:** the price-history endpoints this project needs — intraday
+bars for L1, daily bars for the CAN SLIM technicals — sit behind FMP's Starter
+plan or above. A free key authenticates fine and then 403s on those endpoints,
+which `monitor verify` will show you as *"the key may lack entitlement for this
+endpoint, or your plan does not include it"*. So the genuinely free
+configuration is **insider alerts only**: keep `insider_trades` on and set
+`enabled: false` on everything else.
 
 ```bash
 export SEC_USER_AGENT="stock-movement-monitor you@example.com"

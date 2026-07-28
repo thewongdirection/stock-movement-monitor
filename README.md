@@ -106,7 +106,7 @@ group and post there instead.)
 | `TELEGRAM_BOT_TOKEN` | delivery | @BotFather |
 | `TELEGRAM_CHAT_ID` | delivery | the command above |
 | `UW_API_KEY` | L2 + L3 | [unusualwhales.com/settings/api-dashboard](https://unusualwhales.com/settings/api-dashboard) |
-| `FMP_API_KEY` | L1, and ADV for L2 | [financialmodelingprep.com](https://financialmodelingprep.com/developer) |
+| `FMP_API_KEY` | L1, and ADV for L2 — needs FMP's **Starter** plan or above | [financialmodelingprep.com](https://financialmodelingprep.com/developer) |
 | `SEC_USER_AGENT` | insider filings | your own string, e.g. `stock-monitor you@yourdomain.com` |
 
 `SEC_USER_AGENT` must contain a contact address that actually reaches you —
@@ -114,7 +114,10 @@ SEC's fair-access policy requires it, and the monitor refuses to call EDGAR
 with the shipped example value.
 
 If you only want insider alerts, you need no paid keys at all: set
-`enabled: false` on every other detector.
+`enabled: false` on every other detector. That is the only genuinely free
+configuration — FMP's free tier authenticates but 403s on the price-history
+endpoints L1 and CAN SLIM need, which `monitor verify` reports as a missing
+entitlement rather than a bad key.
 
 Add all five under **Settings → Secrets and variables → Actions**.
 
