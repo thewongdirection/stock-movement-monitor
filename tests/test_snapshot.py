@@ -405,3 +405,123 @@ def test_capture_refuses_to_copy_a_snapshot(tmp_path, capsys):
     )
     assert cli.main(["capture", "-c", str(config_path), "-o", str(tmp_path / "o.json")]) == 2
     assert "already 'snapshot'" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# L2 / L3 feeds
+# --------------------------------------------------------------------------
+def with_feeds(tmp_path, **sections):
+    payload = {
+        "captured_at": SESSION.isoformat(),
+        "source": "test fixture",
+        "interval": "30min",
+        "bars": {"NVDA": rows(3, start=SESSION)},
+        **sections,
+    }
+    path = tmp_path / "snapshot.json"
+    path.write_text(json.dumps(payload))
+    return SnapshotBars(path, as_of=sections.pop("_as_of", None))
+
+
+PRINT = {"ts": "2026-07-27T14:00:00-04:00", "price": 100.0, "size": 50_000,
+         "venue": "FINRA/ADF", "is_off_exchange": True}
+FLOW = {"ts": "2026-07-27T14:00:00-04:00", "premium": 250_000.0, "option_type": "call",
+        "strike": 105.0, "expiry": "2026-08-21", "size": 400, "volume": 400,
+        "open_interest": 100, "trade_type": "sweep"}
+
+
+def test_prints_are_served_from_the_file(tmp_path):
+    provider = with_feeds(tmp_path, prints={"NVDA": [PRINT]})
+    trades = provider.dark_pool_prints("NVDA")
+    assert len(trades) == 1
+    assert trades[0].size == 50_000
+    assert trades[0].is_off_exchange is True
+    assert trades[0].ticker == "NVDA"
+
+
+def test_flow_alerts_are_served_from_the_file(tmp_path):
+    provider = with_feeds(tmp_path, option_trades={"NVDA": [FLOW]})
+    flow = provider.flow_alerts("NVDA")
+    assert len(flow) == 1
+    assert flow[0].premium == 250_000.0
+    assert flow[0].trade_type == "sweep"
+    assert flow[0].open_interest == 100
+
+
+def test_option_volume_is_served_from_the_file(tmp_path):
+    provider = with_feeds(
+        tmp_path,
+        option_volume={"NVDA": {"today_volume": 2_452_910, "average_volume": 3_576_620,
+                                "call_volume": 1_545_895, "put_volume": 907_015}},
+    )
+    today, average, ratio = provider.option_volume_ratio("NVDA")
+    assert today == 2_452_910
+    assert ratio == pytest.approx(0.686, abs=0.001)
+    assert provider.snapshot("NVDA")["option_call_volume"] == 1_545_895
+
+
+def test_events_are_truncated_at_the_run_clock_too(tmp_path):
+    """Lookahead applies to prints and flow, not just bars."""
+    late = dict(PRINT, ts="2026-07-27T15:30:00-04:00")
+    path = tmp_path / "snapshot.json"
+    path.write_text(json.dumps({
+        "interval": "30min", "bars": {"NVDA": rows(3, start=SESSION)},
+        "prints": {"NVDA": [PRINT, late]},
+    }))
+    provider = SnapshotBars(path, as_of=datetime(2026, 7, 27, 14, 30, tzinfo=ET))
+    assert len(provider.dark_pool_prints("NVDA")) == 1
+
+
+def test_a_bars_only_snapshot_says_it_cannot_stand_in_for_a_tape(tmp_path):
+    """Reading empty would look like a quiet market rather than a missing feed."""
+    provider = with_feeds(tmp_path)
+    with pytest.raises(ProviderError) as exc:
+        provider.dark_pool_prints("NVDA")
+    assert "cannot stand in for a tape" in str(exc.value)
+
+    with pytest.raises(ProviderError):
+        provider.flow_alerts("NVDA")
+
+
+def test_missing_option_volume_is_named_not_guessed(tmp_path):
+    provider = with_feeds(tmp_path, option_volume={"MSFT": {"today_volume": 1, "average_volume": 1}})
+    with pytest.raises(ProviderError) as exc:
+        provider.option_volume_ratio("NVDA")
+    assert "no option volume for NVDA" in str(exc.value)
+
+
+def test_a_ticker_with_no_prints_is_empty_not_an_error(tmp_path):
+    """The feed exists; this name simply had nothing. Different from no feed."""
+    provider = with_feeds(tmp_path, prints={"MSFT": [PRINT]})
+    assert provider.dark_pool_prints("NVDA") == []
+
+
+def test_every_provider_role_can_be_pointed_at_the_snapshot():
+    cfg = config_mod.from_dict({
+        "tickers": ["NVDA"],
+        "providers": {"bars": "snapshot", "trades": "snapshot", "flow": "snapshot",
+                      "option_volume": "snapshot", "snapshot": {"path": "state/s.json"}},
+    })
+    assert cfg.issues == []
+    assert cfg.providers.trades == "snapshot"
+
+
+def test_any_snapshot_role_without_a_path_is_a_config_error():
+    """Bars may be live while prints replay; either way the file is required."""
+    cfg = config_mod.from_dict({"tickers": ["NVDA"], "providers": {"trades": "snapshot"}})
+    assert any(i.path == "providers.snapshot.path" for i in cfg.issues)
+
+
+def test_replaying_only_the_prints_still_flags_the_run(tmp_path, state):
+    """Bars live, prints from a file, is still a replay and must say so."""
+    from monitor.providers.snapshot import write_snapshot
+
+    path = write_snapshot(tmp_path / "s.json", {"TEST": [
+        Bar(ts=SESSION, open=1, high=1, low=1, close=1, volume=1)]},
+        interval="5min", source="unit test", captured_at=SESSION)
+    cfg = config_mod.from_dict({
+        "tickers": ["TEST"],
+        "detectors": {n: {"enabled": False} for n in config_mod.DETECTOR_SPECS},
+        "providers": {"trades": "snapshot", "snapshot": {"path": str(path)}},
+    })
+    assert engine.Providers(cfg, now=SESSION).replaying is not None

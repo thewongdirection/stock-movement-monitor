@@ -756,9 +756,9 @@ def _provider_config(value: dict[str, Any], issues: list[Issue]) -> ProviderConf
     cfg = ProviderConfig()
     roles = {
         "bars": ("fmp", "ibkr", "snapshot"),
-        "trades": ("unusual_whales",),
-        "flow": ("unusual_whales",),
-        "option_volume": ("ibkr",),
+        "trades": ("unusual_whales", "snapshot"),
+        "flow": ("unusual_whales", "snapshot"),
+        "option_volume": ("ibkr", "snapshot"),
         "insider": ("sec_edgar",),
     }
     for role, allowed in roles.items():
@@ -816,12 +816,13 @@ def _provider_config(value: dict[str, Any], issues: list[Issue]) -> ProviderConf
     snapshot = value.get("snapshot") or {}
     if isinstance(snapshot, dict):
         cfg.snapshot_path = str(snapshot.get("path", "") or "")
-    if cfg.bars == "snapshot" and not cfg.snapshot_path:
+    replaying = {cfg.bars, cfg.trades, cfg.flow, cfg.option_volume}
+    if "snapshot" in replaying and not cfg.snapshot_path:
         issues.append(
             Issue(
                 "providers.snapshot.path",
-                "bars: snapshot needs a file to replay — set providers.snapshot.path "
-                "or write one with `monitor capture`",
+                "a provider is set to `snapshot` but there is no file to replay — "
+                "set providers.snapshot.path, or write one with `monitor capture`",
             )
         )
 

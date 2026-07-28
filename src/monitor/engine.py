@@ -161,7 +161,10 @@ class Providers:
         )
 
     @property
-    def ibkr(self) -> IBKRProvider:
+    def ibkr(self):
+        if self.config.providers.option_volume == "snapshot":
+            return self.snapshot
+
         def build() -> IBKRProvider:
             provider = IBKRProvider(
                 base_url=self.config.providers.ibkr_base_url,
@@ -184,7 +187,10 @@ class Providers:
     @property
     def replaying(self) -> SnapshotBars | None:
         """The snapshot in use, if any — for the footer's replay warning."""
-        if self.config.providers.bars != "snapshot":
+        providers = self.config.providers
+        if "snapshot" not in {
+            providers.bars, providers.trades, providers.flow, providers.option_volume
+        }:
             return None
         try:
             return self.snapshot
@@ -192,7 +198,10 @@ class Providers:
             return None
 
     @property
-    def uw(self) -> UnusualWhalesProvider:
+    def uw(self):
+        """Prints and flow — live, or replayed from the same snapshot as bars."""
+        if self.config.providers.trades == "snapshot":
+            return self.snapshot
         return self._get(
             "uw",
             lambda: UnusualWhalesProvider(

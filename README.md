@@ -522,6 +522,12 @@ Because replay hands the engine stale data deliberately, it is fenced:
 - **The interval must match.** A 30-minute bar judged against a 5-minute baseline
   is a fabricated anomaly, so a mismatch is refused rather than averaged.
 
+A capture can carry the L2/L3 feeds too — `prints`, `option_trades` and
+`option_volume` alongside `bars` — so `providers.trades`, `flow` and
+`option_volume` can each be pointed at the file independently. A detector whose
+feed is *absent* from the snapshot raises rather than reading empty: silence
+would look like a quiet market instead of a missing feed.
+
 ---
 
 ## Known limitations

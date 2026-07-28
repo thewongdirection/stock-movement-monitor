@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from ..models import Bar
+from ..models import Bar, OptionTrade, OptionVolumeSnapshot, Side, Trade
 from .base import ProviderError, SetupError
 
 #: Bars are normalised to US/Eastern on the way in, exactly as the FMP and IBKR
@@ -107,6 +107,12 @@ class SnapshotBars:
         if not self._bars:
             raise SetupError(f"snapshot file {self.path} contained no usable bars")
 
+        # The L2/L3 feeds are optional: a bars-only capture is the common case,
+        # and a detector whose feed is absent says so rather than reading empty.
+        self._prints = _parse_map(payload.get("prints"), _parse_trade)
+        self._flow = _parse_map(payload.get("option_trades"), _parse_option_trade)
+        self._option_volume = _parse_option_volume(payload.get("option_volume"))
+
     # -- provider interface ------------------------------------------------
     def visible(self, symbol: str) -> list[Bar] | None:
         """Bars for a symbol, truncated at the run clock."""
@@ -161,6 +167,52 @@ class SnapshotBars:
             return None
         window = complete[-sessions:]
         return sum(window) / len(window)
+
+    # -- L2: individual prints --------------------------------------------
+    def dark_pool_prints(self, ticker: str, limit: int = 200) -> list[Trade]:
+        return self._events("prints", self._prints, ticker, limit)
+
+    # -- L3: options flow --------------------------------------------------
+    def flow_alerts(self, ticker: str, limit: int = 200) -> list[OptionTrade]:
+        return self._events("option_trades", self._flow, ticker, limit)
+
+    # -- L3-lite: whole-chain option volume -------------------------------
+    def option_volume_ratio(
+        self, symbol: str
+    ) -> tuple[float | None, float | None, float | None]:
+        snap = self._option_volume.get(symbol.upper())
+        if snap is None:
+            raise ProviderError(
+                f"the snapshot has no option volume for {symbol}. Capture it from a "
+                "live IBKR gateway, or turn the option_volume detector off for this "
+                "replay."
+            )
+        today, average = snap.today_volume, snap.average_volume
+        if not today or not average or average <= 0:
+            return today, average, None
+        return today, average, today / average
+
+    def snapshot(self, symbol: str) -> dict[str, float | None]:
+        """The call/put split, for the option_volume detector's skew read."""
+        snap = self._option_volume.get(symbol.upper())
+        if snap is None:
+            return {}
+        return {
+            "option_call_volume": snap.call_volume,
+            "option_put_volume": snap.put_volume,
+        }
+
+    def _events(self, label: str, store: dict, ticker: str, limit: int) -> list:
+        if not store:
+            raise ProviderError(
+                f"the snapshot holds no `{label}` — a file of bars cannot stand in "
+                f"for a tape. Capture it from a live provider, or turn the "
+                f"detectors that need it off for this replay."
+            )
+        rows = store.get(ticker.upper(), [])
+        if self.as_of is not None:
+            rows = [row for row in rows if row.ts <= self.as_of]
+        return rows[-limit:]
 
     def close(self) -> None:
         return None
@@ -243,6 +295,102 @@ def _parse_rows(symbol: str, rows: Any) -> list[Bar]:
         )
     out.sort(key=lambda b: b.ts)
     return out
+
+
+def _parse_map(raw: Any, parse) -> dict[str, list]:
+    """Parse a {ticker: [rows]} section, dropping rows that don't make sense."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list] = {}
+    for symbol, rows in raw.items():
+        if not isinstance(rows, list):
+            continue
+        parsed = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item = parse(str(symbol).upper(), row)
+            if item is not None:
+                parsed.append(item)
+        if parsed:
+            out[str(symbol).upper()] = sorted(parsed, key=lambda r: r.ts)
+    return out
+
+
+def _parse_trade(symbol: str, row: dict) -> Trade | None:
+    ts = _read_time(row.get("ts"))
+    if ts is None:
+        return None
+    try:
+        return Trade(
+            ticker=symbol,
+            ts=ts.astimezone(ET),
+            price=float(row["price"]),
+            size=int(row["size"]),
+            venue=row.get("venue"),
+            is_off_exchange=bool(row.get("is_off_exchange", True)),
+            side=Side(str(row.get("side", "unknown"))),
+            nbbo_bid=_opt_float(row.get("nbbo_bid")),
+            nbbo_ask=_opt_float(row.get("nbbo_ask")),
+            raw_id=row.get("raw_id"),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _parse_option_trade(symbol: str, row: dict) -> OptionTrade | None:
+    ts = _read_time(row.get("ts"))
+    if ts is None:
+        return None
+    try:
+        return OptionTrade(
+            ticker=symbol,
+            ts=ts.astimezone(ET),
+            premium=float(row["premium"]),
+            option_type=str(row["option_type"]),
+            strike=float(row["strike"]),
+            expiry=str(row["expiry"]),
+            size=int(row["size"]),
+            volume=_opt_int(row.get("volume")),
+            open_interest=_opt_int(row.get("open_interest")),
+            trade_type=row.get("trade_type"),
+            side=Side(str(row.get("side", "unknown"))),
+            underlying_price=_opt_float(row.get("underlying_price")),
+            raw_id=row.get("raw_id"),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _parse_option_volume(raw: Any) -> dict[str, OptionVolumeSnapshot]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, OptionVolumeSnapshot] = {}
+    for symbol, row in raw.items():
+        if not isinstance(row, dict):
+            continue
+        out[str(symbol).upper()] = OptionVolumeSnapshot(
+            ticker=str(symbol).upper(),
+            today_volume=_opt_float(row.get("today_volume")),
+            average_volume=_opt_float(row.get("average_volume")),
+            call_volume=_opt_float(row.get("call_volume")),
+            put_volume=_opt_float(row.get("put_volume")),
+        )
+    return out
+
+
+def _opt_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _first(row: dict, aliases: tuple[str, ...]) -> Any:
