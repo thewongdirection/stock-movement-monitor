@@ -50,9 +50,10 @@ BAR_SIZES = {
     "1min": "1min",
     "5min": "5min",
     "15min": "15min",
+    "30min": "30min",
 }
 
-INTERVAL_MINUTES = {"30sec": 0.5, "1min": 1, "5min": 5, "15min": 15}
+INTERVAL_MINUTES = {"30sec": 0.5, "1min": 1, "5min": 5, "15min": 15, "30min": 30}
 
 #: Client Portal market-data field IDs. Overridable in config because they have
 #: shifted between gateway builds.

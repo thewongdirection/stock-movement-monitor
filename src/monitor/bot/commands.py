@@ -727,7 +727,7 @@ def _missing_credentials(cfg: Config) -> list[tuple[str, str]]:
     from ..providers.sec_edgar import is_placeholder_user_agent
 
     wanted: list[tuple[str, str]] = []
-    if cfg.needs("bars"):
+    if cfg.needs("bars") and cfg.providers.bars == "fmp":
         wanted.append(("FMP_API_KEY", "no intraday bars, so no volume anomalies"))
     if cfg.needs("trades") or cfg.needs("flow"):
         wanted.append(("UW_API_KEY", "no dark-pool prints or options flow"))

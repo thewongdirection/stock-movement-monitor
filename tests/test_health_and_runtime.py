@@ -126,6 +126,8 @@ class FlakyBars:
 
 
 class Providers:
+    replaying = None
+
     def __init__(self, bars):
         self.bars = bars
 

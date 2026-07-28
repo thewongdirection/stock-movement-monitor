@@ -1,0 +1,37 @@
+# Replay config — runs the real detectors against a captured file.
+#
+# This is how you tune a threshold: change a number, re-run, see what would have
+# fired. No API budget, no key, and the same code path the cron uses.
+#
+#   monitor capture -o state/snapshot.json     # from a live provider
+#   monitor run -c config.replay.yaml --as-of 2026-07-22T11:31:00-04:00
+#
+# `--as-of` sets the run clock so the session gate and the bar-completeness
+# checks reason about the moment being replayed. It forces --dry-run: an alert
+# stamped last Tuesday must never actually be sent.
+tickers:
+  - NVDA
+
+detectors:
+  volume_anomaly:
+    enabled: true
+    bar_interval: 30min        # must match the snapshot's interval
+    baseline_sessions: 12
+  # The rest need live feeds a file can't stand in for.
+  block_trades: {enabled: false}
+  dark_pool: {enabled: false}
+  options_flow: {enabled: false}
+  option_volume: {enabled: false}
+  insider_trades: {enabled: false}
+
+run:
+  attach_canslim: false        # needs FMP; not what we're replaying
+  # Wide open for replay. Live, this window stops a lost state file replaying a
+  # whole day of alerts; replaying is exactly what we want here, so let every
+  # bar in the session be a candidate.
+  cold_start_lookback_minutes: 400
+
+providers:
+  bars: snapshot
+  snapshot:
+    path: state/snapshot-nvda.json

@@ -72,6 +72,10 @@ class StubSEC:
 
 
 class StubProviders:
+    #: No snapshot in play, so no replay banner. Every provider bundle has to
+    #: answer this — a run that can't say whether it replayed is the bug.
+    replaying = None
+
     def __init__(self, bars=None, uw=None, sec=None):
         self.bars = bars or StubBars()
         self.uw = uw or StubUW()

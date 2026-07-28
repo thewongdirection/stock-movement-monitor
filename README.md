@@ -8,7 +8,7 @@ Six independent detectors, each switchable and tunable:
 
 | | Detector | What it catches | Data source |
 |---|---|---|---|
-| **L1** | `volume_anomaly` | Abnormal volume on 30s/1/5/15-minute bars, normalised by time of day | FMP or IBKR |
+| **L1** | `volume_anomaly` | Abnormal volume on 30s/1/5/15/30-minute bars, normalised by time of day | FMP, IBKR, or a replay file |
 | **L2** | `block_trades` | Individual large prints, sized in shares | Unusual Whales |
 | **L2** | `dark_pool` | Off-exchange prints, sized in dollars and % of ADV | Unusual Whales |
 | **L3** | `options_flow` | Whale premium, sweeps, volume-over-open-interest | Unusual Whales |
@@ -309,6 +309,9 @@ monitor run                 one polling cycle (what the cron calls)
   --dry-run                 print alerts instead of sending; leaves state untouched
   --force                   run session-bound detectors even when the market is closed
   --no-grade                don't attach scorecards, whatever attach_canslim says
+  --as-of TIMESTAMP         run the clock at an ISO-8601 moment (implies --dry-run)
+monitor capture             save bars to a file for replay
+  -o PATH                   where to write it (default state/snapshot.json)
 monitor validate            strict config check — exits 1 on any problem
 monitor verify              live probe of every provider endpoint
 monitor explain [detector]  thresholds, defaults, bounds and rationale
@@ -488,6 +491,36 @@ answer, so the rule is: fetch fresh, and where something is reused, stamp it.
   the other way round.
 - **A failed grade returns nothing, never stale figures.** Same for a failed
   fetch: the detector stays silent and the run footer says why.
+
+### Replay, for tuning thresholds
+
+The one place old data *is* the point. `rvol_threshold: 2.0` is a guess until you
+have watched it against a real session, and you cannot iterate on a guess at one
+cron tick every five minutes.
+
+```bash
+monitor capture -o state/snapshot.json          # from whatever provider is live
+# then, in a config with providers.bars: snapshot and snapshot.path set:
+monitor run -c config.replay.yaml --as-of 2026-07-22T11:31:00-04:00
+```
+
+Change a threshold, re-run, see what would have fired. Same engine, same
+detectors, same code path the cron uses — no API budget, no key. It is also how
+the pipeline can be exercised in CI, where there are no credentials at all.
+
+Because replay hands the engine stale data deliberately, it is fenced:
+
+- **No lookahead.** `--as-of` truncates the file at the run clock, and the footer
+  says how many later bars were withheld. A replay that can see its own future
+  makes every threshold you tune look better than it is.
+- **`--as-of` forces `--dry-run`.** An alert stamped last Tuesday arriving on your
+  phone today is worse than no alert.
+- **The run footer leads with `⏪ Replay run`** and names the file, its source and
+  the age of the newest visible bar. Leaving `bars: snapshot` in a committed
+  config and believing you are being alerted on a live market is the failure this
+  guards against.
+- **The interval must match.** A 30-minute bar judged against a 5-minute baseline
+  is a fabricated anomaly, so a mismatch is refused rather than averaged.
 
 ---
 

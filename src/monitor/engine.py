@@ -47,6 +47,7 @@ from .providers.base import ProviderError, SetupError
 from .providers.fmp import FMPProvider
 from .providers.ibkr import IBKRProvider
 from .providers.sec_edgar import SECEdgarProvider, default_since
+from .providers.snapshot import SnapshotBars
 from .providers.unusual_whales import UnusualWhalesProvider
 from .state import State
 
@@ -83,6 +84,9 @@ class RunResult:
     ran_session_detectors: bool = True
     health_summary: str = ""
     graded: list[str] = field(default_factory=list)
+    #: Set when bars came from a file rather than a live feed. Never empty on a
+    #: replay — a run that quietly looks live is the whole risk of the feature.
+    replay_note: str = ""
 
     @property
     def ok(self) -> bool:
@@ -121,8 +125,11 @@ class Providers:
     one per ticker.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, now: datetime | None = None):
         self.config = config
+        #: The run clock, needed only by the snapshot provider so a replay cannot
+        #: see bars dated after the moment being replayed.
+        self.now = now
         self._built: dict[str, object] = {}
         self._setup_errors: dict[str, SetupError] = {}
 
@@ -139,9 +146,11 @@ class Providers:
 
     @property
     def bars(self):
-        """Whichever bars provider is configured — FMP or an IBKR gateway."""
+        """Whichever bars provider is configured — FMP, an IBKR gateway, or a file."""
         if self.config.providers.bars == "ibkr":
             return self.ibkr
+        if self.config.providers.bars == "snapshot":
+            return self.snapshot
         return self._get(
             "bars",
             lambda: FMPProvider(
@@ -164,6 +173,23 @@ class Providers:
             return provider
 
         return self._get("ibkr", build)
+
+    @property
+    def snapshot(self) -> SnapshotBars:
+        return self._get(
+            "snapshot",
+            lambda: SnapshotBars(self.config.providers.snapshot_path, as_of=self.now),
+        )
+
+    @property
+    def replaying(self) -> SnapshotBars | None:
+        """The snapshot in use, if any — for the footer's replay warning."""
+        if self.config.providers.bars != "snapshot":
+            return None
+        try:
+            return self.snapshot
+        except SetupError:
+            return None
 
     @property
     def uw(self) -> UnusualWhalesProvider:
@@ -233,7 +259,7 @@ def run(
         return result
 
     owned = providers is None
-    providers = providers or Providers(config)
+    providers = providers or Providers(config, now=now)
     candidates: list[Alert] = []
     # Newest event timestamp per feed across the whole watchlist. One thin ticker
     # going quiet proves nothing; all of them going quiet means a frozen feed.
@@ -246,6 +272,10 @@ def run(
                     feed_newest,
                 )
             )
+        replaying = providers.replaying
+        if replaying is not None:
+            result.replay_note = replaying.provenance(now)
+            log.warning("%s", result.replay_note)
     finally:
         if owned:
             providers.close()
@@ -595,6 +625,8 @@ def _footer(config: Config, result: RunResult) -> str:
     """
     esc = html.escape
     blocks: list[str] = []
+    if result.replay_note:
+        blocks.append("⏪ <b>Replay run</b>\n" + esc(result.replay_note))
     if result.health_summary:
         blocks.append(result.health_summary)
     if config.issues:

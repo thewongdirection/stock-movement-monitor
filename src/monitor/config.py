@@ -24,9 +24,11 @@ VOLUME_ANOMALY = {
     "enabled": Param(True, kind="bool", doc="Turn this detector on or off."),
     "bar_interval": Param(
         "5min",
-        choices=("1min", "5min", "15min"),
+        choices=("1min", "5min", "15min", "30min"),
         kind="str",
-        doc="Bar size to test. 1min is twitchy; 5min is the usual compromise.",
+        doc="Bar size to test. 1min is twitchy; 5min is the usual compromise; "
+        "15min and 30min are quieter and need fewer sessions of history for the "
+        "same number of baseline samples.",
     ),
     "rvol_threshold": Param(
         2.0,
@@ -523,6 +525,9 @@ class ProviderConfig:
     ibkr_base_url: str = ""
     ibkr_fields: dict[str, str] = field(default_factory=dict)
     ibkr_volume_multiplier: int = 100
+    #: Replay source for `bars: snapshot`. Deliberately has no default path —
+    #: replay must be asked for explicitly, never fallen into.
+    snapshot_path: str = ""
 
 
 @dataclass
@@ -750,7 +755,7 @@ def _clean_overrides(
 def _provider_config(value: dict[str, Any], issues: list[Issue]) -> ProviderConfig:
     cfg = ProviderConfig()
     roles = {
-        "bars": ("fmp", "ibkr"),
+        "bars": ("fmp", "ibkr", "snapshot"),
         "trades": ("unusual_whales",),
         "flow": ("unusual_whales",),
         "option_volume": ("ibkr",),
@@ -807,6 +812,18 @@ def _provider_config(value: dict[str, Any], issues: list[Issue]) -> ProviderConf
                         "expected an integer (100 for lot-quoted history, 1 for shares)",
                     )
                 )
+
+    snapshot = value.get("snapshot") or {}
+    if isinstance(snapshot, dict):
+        cfg.snapshot_path = str(snapshot.get("path", "") or "")
+    if cfg.bars == "snapshot" and not cfg.snapshot_path:
+        issues.append(
+            Issue(
+                "providers.snapshot.path",
+                "bars: snapshot needs a file to replay — set providers.snapshot.path "
+                "or write one with `monitor capture`",
+            )
+        )
 
     sec = value.get("sec") or {}
     if isinstance(sec, dict):

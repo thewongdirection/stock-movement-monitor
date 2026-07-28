@@ -256,6 +256,47 @@ Once a dry run looks right, untick `dry_run` and let the schedule take over.
 
 ---
 
+## Step 8b — Optional: tune thresholds against a real session
+
+The defaults are conventional, not tailored to your names. Before trusting them,
+capture a session and replay it:
+
+```bash
+PYTHONPATH=src python -m monitor capture -o state/snapshot.json
+```
+
+That prints how many bars it got per ticker and the config block to paste. Make a
+`config.replay.yaml` from it:
+
+```yaml
+tickers: [NVDA]
+detectors:
+  volume_anomaly: {enabled: true, bar_interval: 30min}
+  block_trades: {enabled: false}
+  dark_pool: {enabled: false}
+  options_flow: {enabled: false}
+  option_volume: {enabled: false}
+  insider_trades: {enabled: false}
+run:
+  attach_canslim: false
+  cold_start_lookback_minutes: 400   # wide open, so every bar is a candidate
+providers:
+  bars: snapshot
+  snapshot: {path: state/snapshot.json}
+```
+
+Then replay any moment in it:
+
+```bash
+PYTHONPATH=src python -m monitor run -c config.replay.yaml \
+  --as-of 2026-07-22T11:31:00-04:00
+```
+
+Change `rvol_threshold`, run it again, and see what would have fired. Free, fast,
+repeatable. Two things to know: `--as-of` forces `--dry-run`, and it truncates the
+file at that clock so the replay cannot see its own future. `bar_interval` must
+match the interval you captured at.
+
 ## Step 9 — Run the bot when you want to talk to it
 
 The cron sends alerts on its own. Interactive commands only work while the bot
@@ -279,6 +320,7 @@ box. Everything you tried in the console in step 3 works here, plus `/grade` and
 | `state/runtime.json` | live edits made from the bot; `/reset` clears it |
 | `state/monitor.db` | dedup keys, watermarks, signal history |
 | `state/reports/` | generated CAN SLIM HTML and PDFs |
+| `state/snapshot.json` | captured bars for replay, if you made one |
 | `.env` | your keys, gitignored — never commit it |
 
 On GitHub Actions the whole `state/` directory lives in the Actions cache.

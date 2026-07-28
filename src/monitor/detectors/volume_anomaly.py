@@ -24,7 +24,7 @@ from .. import market_calendar as cal
 from ..models import Alert, Bar, Severity
 from .base import Context, Detector, combine_ok, escalate, money, shares
 
-INTERVAL_MINUTES = {"1min": 1, "5min": 5, "15min": 15}
+INTERVAL_MINUTES = {"1min": 1, "5min": 5, "15min": 15, "30min": 30}
 
 #: Below this many same-slot observations the baseline is not worth trusting.
 MIN_BASELINE_SAMPLES = 5

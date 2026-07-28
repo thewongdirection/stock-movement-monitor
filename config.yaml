@@ -197,6 +197,13 @@ providers:
     # reports which ones answered; correct them here rather than in code.
     fields: {}
 
+  # Replay a captured file instead of calling a provider. For tuning thresholds
+  # against a real session — see `monitor capture` and `monitor run --as-of`.
+  # Leaving this on in a committed config would mean you are not being alerted on
+  # a live market, so the run footer says loudly when a replay happened.
+  snapshot:
+    path: ""                # required when bars: snapshot
+
   sec:
     # SEC's fair-access policy requires a real contact address here.
     # Overridden by the SEC_USER_AGENT environment variable.

@@ -20,7 +20,12 @@ log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 
-INTERVAL_ALIASES = {"1min": "1min", "5min": "5min", "15min": "15min"}
+INTERVAL_ALIASES = {
+    "1min": "1min",
+    "5min": "5min",
+    "15min": "15min",
+    "30min": "30min",
+}
 
 
 class FMPProvider:

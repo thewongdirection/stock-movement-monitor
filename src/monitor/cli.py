@@ -92,7 +92,21 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="don't attach CAN SLIM scorecards, whatever run.attach_canslim says",
     )
+    run_p.add_argument(
+        "--as-of",
+        metavar="TIMESTAMP",
+        help="run the clock at this ISO-8601 moment instead of now — for replaying "
+        "a snapshot through the session gate. Implies --dry-run.",
+    )
     run_p.set_defaults(handler=cmd_run)
+
+    capture_p = with_config(
+        sub.add_parser("capture", help="save bars to a file for replay")
+    )
+    capture_p.add_argument(
+        "-o", "--out", default="state/snapshot.json", help="where to write it"
+    )
+    capture_p.set_defaults(handler=cmd_capture)
 
     validate_p = with_config(sub.add_parser("validate", help="strict config check"))
     validate_p.set_defaults(handler=cmd_validate)
@@ -272,19 +286,42 @@ def cmd_run(args: argparse.Namespace) -> int:
     for change in overlay.describe():
         logging.info("overlay: %s", change)
 
-    notifier = ConsoleNotifier() if args.dry_run else _telegram()
-    state_path = ":memory:" if args.dry_run else args.state
+    now: datetime | None = None
+    dry_run = args.dry_run
+    if getattr(args, "as_of", None):
+        try:
+            now = datetime.fromisoformat(str(args.as_of).replace("Z", "+00:00"))
+        except ValueError:
+            print(
+                f"--as-of: {args.as_of!r} is not an ISO-8601 timestamp "
+                "(e.g. 2026-07-27T15:50:00-04:00)",
+                file=sys.stderr,
+            )
+            return 2
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        # A back-dated clock must never send. Alerts carry a time, and one stamped
+        # last Tuesday arriving on your phone today is worse than no alert.
+        dry_run = True
+        print(f"⏪ replay: running the clock at {now.isoformat()} (dry-run forced)\n")
+
+    notifier = ConsoleNotifier() if dry_run else _telegram()
+    state_path = ":memory:" if dry_run else args.state
 
     canslim = None
     if bool(cfg.run["attach_canslim"]) and not args.no_grade:
         canslim = _canslim(cfg)
     try:
         with State(state_path) as state:
-            result = engine.run(cfg, state, notifier, force=args.force, canslim=canslim)
+            result = engine.run(
+                cfg, state, notifier, now=now, force=args.force, canslim=canslim
+            )
     finally:
         if canslim is not None:
             canslim.close()
 
+    if result.replay_note:
+        print(f"\n⏪ {result.replay_note}")
     print(f"\n{result.summary()} · {result.session_note}")
     if not result.ran_session_detectors:
         print("session-bound detectors were skipped; insider filings still checked")
@@ -296,6 +333,64 @@ def cmd_run(args: argparse.Namespace) -> int:
     # A run that alerted successfully but hit a provider error is still a
     # degraded run, and CI should show it as such.
     return 0 if result.ok else 1
+
+
+def cmd_capture(args: argparse.Namespace) -> int:
+    """Save the current bars to a file so a run can be replayed against them.
+
+    The point is threshold tuning: `rvol_threshold: 2.5` is a guess until you have
+    watched it against a real session, and you cannot iterate on a guess at one
+    cron tick every five minutes.
+    """
+    from .providers.snapshot import write_snapshot
+
+    cfg = config_mod.load(args.config, strict=False)
+    if cfg.providers.bars == "snapshot":
+        print(
+            "providers.bars is already 'snapshot' — capturing from a snapshot would "
+            "just copy it. Point bars at fmp or ibkr first.",
+            file=sys.stderr,
+        )
+        return 2
+
+    interval = str(cfg.detector("volume_anomaly")["bar_interval"])
+    providers = engine.Providers(cfg)
+    captured: dict[str, list] = {}
+    failures: list[str] = []
+    try:
+        for ticker in cfg.tickers:
+            try:
+                bars = providers.bars.intraday_bars(ticker, interval)
+            except ProviderError as exc:
+                failures.append(f"{ticker}: {exc}")
+                continue
+            if bars:
+                captured[ticker] = bars
+                span = f"{bars[0].ts:%Y-%m-%d} → {bars[-1].ts:%Y-%m-%d %H:%M %Z}"
+                print(f"  {ticker}: {len(bars):,} bars  {span}")
+            else:
+                failures.append(f"{ticker}: provider returned no bars")
+    finally:
+        providers.close()
+
+    for failure in failures:
+        print(f"  ! {failure}", file=sys.stderr)
+    if not captured:
+        print("nothing captured", file=sys.stderr)
+        return 1
+
+    path = write_snapshot(
+        args.out,
+        captured,
+        interval=interval,
+        source=f"{cfg.providers.bars} at capture time",
+        captured_at=datetime.now(timezone.utc),
+    )
+    print(f"\n✓ wrote {path} ({path.stat().st_size:,} bytes)")
+    print("\nTo replay it:")
+    print("  providers:\n    bars: snapshot\n    snapshot:\n      path: " + str(path))
+    print(f"  monitor run --as-of {captured[next(iter(captured))][-1].ts.isoformat()}")
+    return 0 if not failures else 1
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -498,7 +593,10 @@ def _missing_secrets(cfg: config_mod.Config) -> list[tuple[str, str]]:
         ("TELEGRAM_BOT_TOKEN", "alert delivery"),
         ("TELEGRAM_CHAT_ID", "alert delivery"),
     ]
-    if cfg.needs("bars"):
+    # Only FMP takes a key. An IBKR gateway authenticates interactively and a
+    # snapshot is a file, so asking for FMP_API_KEY in either case is noise that
+    # trains you to ignore this list.
+    if cfg.needs("bars") and cfg.providers.bars == "fmp":
         wanted.append(("FMP_API_KEY", "intraday bars for the volume detector"))
     if cfg.needs("trades") or cfg.needs("flow"):
         wanted.append(("UW_API_KEY", "dark pool prints and options flow"))
