@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import time
 from typing import Any, Mapping, Sequence
 
@@ -12,6 +13,19 @@ import requests
 log = logging.getLogger(__name__)
 
 RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+#: Query parameters that carry a credential. FMP puts the key straight in the
+#: URL, so any log line containing a URL is a log line containing the key —
+#: which then lands in the terminal, in CI output and in whatever collects it.
+#: GitHub masks registered secrets; nothing masks them on your own machine.
+SECRET_PARAMS = re.compile(
+    r"((?:apikey|api_key|token|key|access_token|auth)=)[^&\s]+", re.IGNORECASE
+)
+
+
+def redact(text: str) -> str:
+    """Blank out credentials in anything about to be logged or surfaced."""
+    return SECRET_PARAMS.sub(r"\1<redacted>", str(text))
 
 #: Sent on every provider request. A monitor exists to see what is happening
 #: *now*, so a cached response is not a cheap win — it is a wrong answer that
@@ -83,9 +97,9 @@ class RateLimitedSession:
             snippet = response.text[:200].replace("\n", " ")
             raise ProviderError(
                 f"expected JSON but got {response.headers.get('content-type', '?')}: "
-                f"{snippet}",
+                f"{redact(snippet)}",
                 status=response.status_code,
-                url=url,
+                url=redact(url),
             ) from exc
 
     def get(
@@ -109,12 +123,13 @@ class RateLimitedSession:
                 raise ProviderError(
                     _explain(response),
                     status=response.status_code,
-                    url=url,
+                    url=redact(url),
                 )
             return response
 
         raise ProviderError(
-            f"giving up after {self.max_attempts} attempts: {last_error}", url=url
+            f"giving up after {self.max_attempts} attempts: {redact(last_error)}",
+            url=redact(url),
         )
 
     def _backoff(
@@ -128,11 +143,16 @@ class RateLimitedSession:
             retry_after = response.headers.get("retry-after")
             if retry_after and retry_after.isdigit():
                 delay = min(float(retry_after), 30.0)
-                log.warning("%s on %s; honouring Retry-After %ss", reason, url, delay)
+                log.warning(
+                    "%s on %s; honouring Retry-After %ss", redact(reason), redact(url), delay
+                )
                 time.sleep(delay)
                 return
         delay = min(2.0 ** (attempt - 1), 8.0) + random.uniform(0, 0.4)
-        log.warning("%s on %s; retrying in %.1fs (attempt %d)", reason, url, delay, attempt)
+        log.warning(
+            "%s on %s; retrying in %.1fs (attempt %d)",
+            redact(reason), redact(url), delay, attempt,
+        )
         time.sleep(delay)
 
     def close(self) -> None:
@@ -152,7 +172,7 @@ def _explain(response: requests.Response) -> str:
         429: "rate limited",
     }
     hint = hints.get(status, "request failed")
-    return f"HTTP {status}: {hint}" + (f" | body: {body}" if body else "")
+    return f"HTTP {status}: {hint}" + (f" | body: {redact(body)}" if body else "")
 
 
 def first_present(payload: Any, keys: Sequence[str], default: Any = None) -> Any:

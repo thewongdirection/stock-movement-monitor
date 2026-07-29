@@ -55,8 +55,12 @@ detectors:
     off_exchange_only: false
     cooldown_minutes: 15
 
+  # Off until UW_API_KEY is set. Left on, these two raise a setup error on every
+  # run, which makes the whole job exit non-zero — a red cron every five minutes
+  # for a detector that could never have fired. Turn back on with `/on dark_pool`
+  # once you have a key.
   dark_pool:
-    enabled: true
+    enabled: false
     min_notional: 1000000
     min_pct_of_adv: 0.5
     combine: any
@@ -64,7 +68,7 @@ detectors:
 
   # ---- L3 -----------------------------------------------------------------
   options_flow:
-    enabled: true
+    enabled: false
     min_premium: 100000       # the conventional "whale" floor
     require_volume_gt_oi: true  # implies a newly opened position
     trade_types: [sweep, block, split]

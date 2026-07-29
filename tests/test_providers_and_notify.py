@@ -372,3 +372,43 @@ def test_the_cli_exits_cleanly_when_delivery_is_unconfigured(tmp_path, monkeypat
     assert code == 2
     assert "config error:" in err
     assert "Traceback" not in err
+
+
+def test_api_keys_are_redacted_before_anything_is_logged():
+    """FMP puts the key in the URL, so every logged URL was a logged credential.
+
+    GitHub masks registered secrets in Actions output; nothing masks them in a
+    terminal or a local log file.
+    """
+    from monitor.providers.base import redact
+
+    url = "https://financialmodelingprep.com/api/v3/x?from=1&apikey=SEKRET123&to=2"
+    cleaned = redact(url)
+    assert "SEKRET123" not in cleaned
+    assert "apikey=<redacted>" in cleaned
+    assert "from=1" in cleaned and "to=2" in cleaned  # non-secrets survive
+
+
+@pytest.mark.parametrize("param", ["apikey", "api_key", "token", "access_token", "auth", "KEY"])
+def test_every_credential_parameter_name_is_covered(param):
+    from monitor.providers.base import redact
+
+    assert "hunter2" not in redact(f"https://x.test/y?{param}=hunter2")
+
+
+def test_redaction_reaches_provider_errors(monkeypatch):
+    """The message on a raised ProviderError is surfaced in the run footer."""
+    import requests
+
+    from monitor.providers.base import ProviderError, RateLimitedSession
+
+    session = RateLimitedSession(max_attempts=1)
+    monkeypatch.setattr(
+        session.session, "get",
+        lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError("failed on apikey=SEKRET123")),
+    )
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    with pytest.raises(ProviderError) as exc:
+        session.get("https://x.test/y?apikey=SEKRET123")
+    assert "SEKRET123" not in str(exc.value)
+    assert "SEKRET123" not in exc.value.url
