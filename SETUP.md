@@ -11,7 +11,7 @@ Two things worth knowing before you start:
 - **Every paid key is optional.** With none of them you still get SEC Form 4
   insider alerts, which are free. Each key you add turns on more detectors.
 
-Time: about 10 minutes to try locally, about 30 to have it running on a cron.
+Time: about 10 minutes to try locally, about 30 to have it running on a box.
 
 ---
 
@@ -231,38 +231,57 @@ narrator](README.md#the-narrator-optional).
 
 ---
 
-## Step 8 — Put it on the cron
+## Step 8 — Install it on the box
 
-The repo ships `.github/workflows/monitor.yml`, which polls every 5 minutes on
-GitHub Actions. No server to keep alive.
+The monitor runs as a **systemd timer** on a VPS or a machine at home. Not
+GitHub Actions: its scheduler drops runs under load, disables workflows after 60
+days idle, and cannot host an IBKR gateway. A €4/month VPS or a Pi on your desk
+does all three properly.
 
-1. Push your `config.yaml` to your own copy of the repo.
-2. Add your keys under **Settings → Secrets and variables → Actions → New
-   repository secret**. Use the same names as the environment variables:
-   `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `FMP_API_KEY`, `UW_API_KEY`,
-   `SEC_USER_AGENT`, and `ANTHROPIC_API_KEY` if you want the narrator.
-3. Go to **Actions**, pick the **monitor** workflow, and hit **Run workflow** —
-   tick `dry_run` for the first one.
-4. Read the run log. It ends with the same summary the dry run printed.
+```bash
+sudo ./deploy/install.sh
+```
 
-Once a dry run looks right, untick `dry_run` and let the schedule take over.
+That copies the tree to `/opt/stock-movement-monitor`, builds a virtualenv,
+writes a starter `config.yaml` and `.env` if they are missing (it never clobbers
+existing ones — re-run it after a `git pull`), and installs three units.
 
-**Three things to know about the cron:**
+Then fill in your credentials and check before enabling anything:
 
-- **Add the secrets before enabling the schedule.** Without
-  `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` the run has nowhere to send
-  alerts, so it exits non-zero and GitHub emails you a failure every time it
-  fires. That is deliberate — a monitor that cannot deliver is broken, and
-  should not look healthy — but it means an unconfigured repo will mail you
-  hourly until you either add the secrets or disable the workflow.
-- **GitHub disables scheduled workflows after 60 days of repo inactivity.** A
-  commit or a manual run resets the clock.
-- **`*/5` is a request, not a promise.** GitHub's scheduler is best-effort and
-  drops runs under load — on a quiet repo, a five-minute cron in practice fires
-  closer to hourly, and irregularly. Fine against a 2-hour target; if you need
-  reliable five-minute latency, run the cron somewhere you control.
+```bash
+sudo -e /opt/stock-movement-monitor/.env          # keys
+sudo -e /opt/stock-movement-monitor/config.yaml   # tickers
 
----
+cd /opt/stock-movement-monitor
+sudo -u $USER .venv/bin/python -m monitor verify
+```
+
+When `verify` is clean:
+
+```bash
+sudo systemctl enable --now monitor.timer     # hourly polling
+sudo systemctl enable --now monitor-bot       # optional: /list, /status, /grade
+```
+
+**Living with it:**
+
+| Command | What |
+|---|---|
+| `systemctl list-timers monitor.timer` | when it next fires, when it last did |
+| `journalctl -u monitor -f` | live log |
+| `journalctl -u monitor --since today` | today's polls |
+| `systemctl start monitor` | poll right now, don't wait for the hour |
+| `systemctl disable --now monitor.timer` | stop polling |
+
+**Why the timer fires hourly all day** rather than only during market hours:
+encoding 09:30–16:00 New York in a unit file means getting DST right in a second
+place, and getting it wrong means silently not polling for a week each spring.
+The application already knows the market calendar — holidays, half-days, early
+closes — and skips the session-bound detectors itself. It also means SEC Form 4
+filings, which land until roughly 22:00 ET, are still picked up in the evening.
+
+`Persistent=true` means a missed run fires on resume, so closing a laptop or
+rebooting the box catches up rather than silently skipping the window.
 
 ## Step 8b — Optional: tune thresholds against a real session
 
@@ -312,10 +331,10 @@ reads the **whole option chain against its own average**, pace-adjusted for how
 much of the session has run. No strike, no premium, no direction — but a genuine
 signal, and free with an IBKR account.
 
-**It cannot run on GitHub Actions.** IBKR has no API key; it talks to a Client
-Portal Gateway that must be running and *interactively logged in*, with a
-session that expires roughly daily. An ephemeral runner has nothing to log into.
-So this needs a machine you control that stays on.
+IBKR has no API key. It talks to a Client Portal Gateway that must be running
+and *interactively logged in*, with a session that expires roughly daily. That
+is exactly why the monitor lives on a box you control — the gateway runs
+alongside it.
 
 1. **Get the gateway.** Download the Client Portal Gateway from IBKR, or run
    their container image. It listens on `https://localhost:5000` with a
@@ -326,7 +345,9 @@ So this needs a machine you control that stays on.
    repeat this roughly daily — that is the operational cost of IBKR. Tools like
    IBC can automate the re-login if you want it unattended.
 
-3. **Use the IBKR config**, which is separate so the Actions cron stays green:
+3. **Use the IBKR config.** It is kept separate from `config.yaml` so you can
+   fall back instantly — if the gateway is down or mid-re-auth, the plain config
+   still polls FMP and SEC without you editing anything:
 
    ```bash
    PYTHONPATH=src python -m monitor verify -c config.ibkr.yaml
@@ -379,9 +400,13 @@ box. Everything you tried in the console in step 3 works here, plus `/grade` and
 | `state/snapshot.json` | captured bars for replay, if you made one |
 | `.env` | your keys, gitignored — never commit it |
 
-On GitHub Actions the whole `state/` directory lives in the Actions cache.
-Losing it is safe: the monitor falls back to `run.cold_start_lookback_minutes`
-rather than replaying a whole day of alerts.
+`state/` is a plain directory on the box, so it simply persists — no cache to
+lose. If you do delete it, the monitor falls back to
+`run.cold_start_lookback_minutes` (150, comfortably more than the hourly poll
+gap) rather than replaying a whole day of alerts.
+
+Back it up if you care about the signal history `/history` reads; everything
+else in there rebuilds itself.
 
 ---
 

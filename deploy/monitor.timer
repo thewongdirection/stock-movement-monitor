@@ -1,0 +1,29 @@
+# Fires hourly, all day, every day.
+#
+# WHY NOT A MARKET-HOURS SCHEDULE HERE: encoding 09:30-16:00 America/New_York
+# in a unit file means getting DST right in two places, and getting it wrong
+# means silently not polling for a week each spring. The application already
+# knows the market calendar — holidays, half-days, early closes — and skips the
+# session-bound detectors itself. So the timer stays dumb and the app decides.
+#
+# It also means SEC Form 4 filings, which land until roughly 22:00 ET, are still
+# picked up in the evening. A market-hours timer would miss them entirely.
+
+[Unit]
+Description=Poll the stock movement monitor hourly
+Documentation=https://github.com/thewongdirection/stock-movement-monitor
+
+[Timer]
+# :05 past the hour — after the top-of-hour bar has closed and been published,
+# not during the moment every other cron on the box wakes up.
+OnCalendar=*:05
+# Fire a missed run on resume. A laptop that was closed, or a box that was
+# rebooted, catches up instead of silently skipping the window.
+Persistent=true
+# Spread the actual start over a minute so a fleet of these doesn't stampede
+# the provider at exactly :05:00.
+RandomizedDelaySec=60
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target

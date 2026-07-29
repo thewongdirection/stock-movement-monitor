@@ -1,8 +1,8 @@
 # Stock movement monitor
 
 Telegram alerts for unusually large trades, unusual options flow, and insider
-filings on a watchlist you define. Runs as a GitHub Actions cron — no server to
-keep alive.
+filings on a watchlist you define. Runs as a systemd timer on a VPS or a box at
+home, polling hourly.
 
 Six independent detectors, each switchable and tunable:
 
@@ -15,8 +15,10 @@ Six independent detectors, each switchable and tunable:
 | **L3-lite** | `option_volume` | Whole-chain option volume vs its average | IBKR (no options feed needed) |
 | | `insider_trades` | SEC Form 4 purchases and sales, cluster buys | SEC EDGAR (free) |
 
-Typical latency is one cron interval — about 5 minutes, occasionally 20 when
-GitHub's scheduler is busy. Comfortably inside a 2-hour target.
+Polls hourly by default. That is a deliberate choice, not a limitation: at
+this cadence delayed data is fine, no process needs to stay resident, and the
+job is *position management* — "something happened in a name I hold, go look" —
+rather than trading. Tighten `monitor.timer` if you want it faster.
 
 Every alert can carry a CAN SLIM scorecard as a PDF, scored against the
 [can-slim-grader](https://github.com/thewongdirection/can-slim-grader) rubric —
@@ -126,7 +128,8 @@ configuration — FMP's free tier authenticates but 403s on the price-history
 endpoints L1 and CAN SLIM need, which `monitor verify` reports as a missing
 entitlement rather than a bad key.
 
-Add all five under **Settings → Secrets and variables → Actions**.
+These live in `/opt/stock-movement-monitor/.env`, which `deploy/install.sh`
+creates for you and chmods to 600. See [SETUP.md](SETUP.md) step 8.
 
 ### 2b. Optional: CAN SLIM scorecards
 
@@ -160,8 +163,9 @@ prints — see [IBKR's limits](#what-ibkr-can-and-cannot-do).
 
 The catch is operational: **IBKR has no API key.** It needs a Client Portal
 Gateway running and interactively logged in, with a session that expires roughly
-daily. That works on a machine you control. It cannot work on a GitHub Actions
-runner, so on the cron leave `providers.ibkr.base_url` empty and use FMP.
+daily. Since the monitor runs on a box you control, the gateway sits alongside
+it — see [SETUP.md](SETUP.md) step 8c. Leave `providers.ibkr.base_url` empty to
+use FMP instead.
 
 ### 3. Watchlist
 
@@ -342,10 +346,11 @@ cron (5 min)
      └─ Telegram ────────── one message per alert
 ```
 
-State (dedup keys, read watermarks, cooldowns) lives in SQLite, kept in the
-Actions cache between runs. **Losing that cache is safe:** with no watermark a
-detector falls back to `run.cold_start_lookback_minutes` (30 by default) rather
-than replaying a whole day of alerts at you.
+State (dedup keys, read watermarks, cooldowns) lives in one SQLite file under
+`state/`, which simply persists on the box. **Losing it is safe:** with no
+watermark a detector falls back to `run.cold_start_lookback_minutes` (150 by
+default — comfortably wider than the hourly poll gap) rather than replaying a
+whole day of alerts at you.
 
 Two deliberate reliability choices:
 
@@ -546,16 +551,17 @@ would look like a quiet market instead of a missing feed.
 - **The volume baseline needs intraday history.** Roughly 20 sessions of bars.
   If your FMP plan caps intraday history shorter than that, `verify` will warn
   and the L1 detector will stay quiet rather than judge on a thin baseline.
-- **GitHub's cron is best-effort**, often 5-20 minutes late. Fine for a 2-hour
-  target; if you ever need sub-second alerting on individual prints, that means
-  an always-on process holding a websocket, not this design.
+- **Polling, not streaming.** Hourly ticks mean you learn about a print up to an
+  hour after it happened. If you ever need sub-second alerting, that means an
+  always-on process holding a websocket, which is a different design.
 - **The market calendar is hardcoded** through 2028 (`market_calendar.py`). Past
   that it falls back to weekday logic and says so in the run log — it fails open
   rather than deciding the market is shut.
 - **Interactive commands need `monitor bot` running.** The cron alerts on its
   own; the bot only answers while its process is up. That's the cost of long
   polling instead of a public webhook endpoint.
-- **IBKR needs a logged-in gateway** and cannot run on CI, as above.
+- **IBKR needs a logged-in gateway**, re-authenticated roughly daily. That is
+  the operational cost of the cheapest options data available to you.
 - **CAN SLIM letters are scored programmatically** by default, not by the skill's
   own agent judgement. Turning [the narrator](#the-narrator-optional) on restores
   the judgement half at a per-grade cost — and even then it can only score N, I

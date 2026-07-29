@@ -1,0 +1,43 @@
+# One polling cycle. Fired by monitor.timer; exits when done.
+#
+# Type=oneshot rather than a long-running loop: there is nothing to keep in
+# memory between polls (state lives in SQLite), and a process that exits cannot
+# leak, wedge, or drift. If a poll hangs, the timeout kills it and the next one
+# starts clean.
+
+[Unit]
+Description=Stock movement monitor — one polling cycle
+Documentation=https://github.com/thewongdirection/stock-movement-monitor
+# Don't fire before the network is actually usable, or the first poll after a
+# reboot fails on DNS and reports a provider outage that never happened.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+WorkingDirectory=/opt/stock-movement-monitor
+EnvironmentFile=/opt/stock-movement-monitor/.env
+ExecStart=/opt/stock-movement-monitor/.venv/bin/python -m monitor run
+Environment=PYTHONPATH=/opt/stock-movement-monitor/src
+Environment=PYTHONUNBUFFERED=1
+
+# A poll that has not finished in 10 minutes is stuck, not slow. Killing it
+# frees the next tick to run rather than piling up.
+TimeoutStartSec=600
+
+# Filesystem and privilege hardening. The monitor reads config and writes
+# state; it has no business anywhere else on the box.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/stock-movement-monitor/state
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

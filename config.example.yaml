@@ -111,7 +111,8 @@ overrides:
 # ---------------------------------------------------------------------------
 run:
   extended_hours: false           # also poll pre-market and after-hours
-  cold_start_lookback_minutes: 30 # cap on replay when state is lost
+  cold_start_lookback_minutes: 150 # cap on replay when state is lost;
+                                  # must exceed your polling interval
   max_alerts_per_run: 25          # global circuit breaker
   min_severity: low               # low | medium | high
   state_retention_days: 30
@@ -121,13 +122,15 @@ run:
   # happening" when it means "nobody is looking".
   unresponsive_after: 3           # consecutive failures before reporting an outage
   max_stale_intervals: 4          # bar intervals behind before the feed is "frozen"
-  max_feed_silence_minutes: 60    # no new prints/flow across the WHOLE watchlist
+  max_feed_silence_minutes: 180   # no new prints/flow across the WHOLE watchlist.
+                                  # Set below your poll interval and a quiet feed
+                                  # is called frozen on every single run.
 
   # CAN SLIM scorecards attached to alerts. Graded once per ticker and reused
   # while still fresh, so a busy name costs one grade rather than one per alert.
   attach_canslim: true
   canslim_min_severity: medium    # don't grade every low-severity alert
-  canslim_max_age_minutes: 90     # re-grade rather than quote a stale price
+  canslim_max_age_minutes: 240    # re-grade rather than quote a stale price
 
 # ---------------------------------------------------------------------------
 # CAN SLIM grading

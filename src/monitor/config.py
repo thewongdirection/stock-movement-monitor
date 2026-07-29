@@ -418,7 +418,7 @@ RUN_SPECS = {
         doc="Also run during pre-market and after-hours sessions.",
     ),
     "cold_start_lookback_minutes": Param(
-        30,
+        150,
         lo=5,
         hi=1440,
         kind="int",
@@ -459,14 +459,16 @@ RUN_SPECS = {
         "from the outside, so this is the check that catches it.",
     ),
     "max_feed_silence_minutes": Param(
-        60,
+        180,
         lo=10,
         hi=480,
         kind="int",
         doc="How long the print and flow feeds may go without a single new event "
         "across the whole watchlist before they are called frozen. Per-ticker "
         "silence proves nothing — a thin name really can have no dark-pool prints "
-        "for an hour — but every ticker at once means the feed, not the market.",
+        "for an hour — but every ticker at once means the feed, not the market. "
+        "Must comfortably exceed your polling interval: set below it and a quiet "
+        "feed is flagged frozen on every single run.",
     ),
     "attach_canslim": Param(
         True,
@@ -482,7 +484,7 @@ RUN_SPECS = {
         "grading every low-severity alert is rarely worth the calls.",
     ),
     "canslim_max_age_minutes": Param(
-        90,
+        240,
         lo=0,
         hi=1440,
         kind="int",
