@@ -305,6 +305,54 @@ repeatable. Two things to know: `--as-of` forces `--dry-run`, and it truncates t
 file at that clock so the replay cannot see its own future. `bar_interval` must
 match the interval you captured at.
 
+## Step 8c — Optional: unusual option activity via IBKR
+
+The one unusual-activity signal that needs no Unusual Whales subscription. It
+reads the **whole option chain against its own average**, pace-adjusted for how
+much of the session has run. No strike, no premium, no direction — but a genuine
+signal, and free with an IBKR account.
+
+**It cannot run on GitHub Actions.** IBKR has no API key; it talks to a Client
+Portal Gateway that must be running and *interactively logged in*, with a
+session that expires roughly daily. An ephemeral runner has nothing to log into.
+So this needs a machine you control that stays on.
+
+1. **Get the gateway.** Download the Client Portal Gateway from IBKR, or run
+   their container image. It listens on `https://localhost:5000` with a
+   self-signed certificate, which this project expects.
+
+2. **Log in.** Open `https://localhost:5000` in a browser, accept the
+   certificate warning, and sign in with your IBKR credentials. You will need to
+   repeat this roughly daily — that is the operational cost of IBKR. Tools like
+   IBC can automate the re-login if you want it unattended.
+
+3. **Use the IBKR config**, which is separate so the Actions cron stays green:
+
+   ```bash
+   PYTHONPATH=src python -m monitor verify -c config.ibkr.yaml
+   ```
+
+   You want to see, for each ticker:
+
+   ```
+   ── IBKR (option volume) ──
+     ok — 2,452,910 contracts today vs 3,576,620 average
+        0.69x — below the threshold (min_ratio 2.5)
+   ```
+
+   A ratio below the threshold is the normal state. Most days are quiet.
+
+4. **Point a local cron at it.** On that machine:
+
+   ```
+   */5 * * * *  cd /path/to/stock-movement-monitor && PYTHONPATH=src \
+     .venv/bin/python -m monitor run -c config.ibkr.yaml >> state/cron.log 2>&1
+   ```
+
+`config.ibkr.yaml` also switches **bars** to IBKR — 30-second granularity, a real
+90-day dollar ADV, and no FMP plan tier to worry about. Change `bars` back to
+`fmp` if you would rather keep the gateway load down.
+
 ## Step 9 — Run the bot when you want to talk to it
 
 The cron sends alerts on its own. Interactive commands only work while the bot

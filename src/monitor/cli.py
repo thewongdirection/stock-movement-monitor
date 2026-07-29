@@ -423,7 +423,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
     failures = 0
 
     if cfg.needs("bars"):
-        print("── FMP (intraday bars) ──")
+        # Name whichever provider is configured. Reporting an IBKR gateway
+        # failure under an "FMP" heading sends you to the wrong place.
+        print(f"── {cfg.providers.bars.upper()} (intraday bars) ──")
         try:
             provider = engine.Providers(cfg).bars
             bars = provider.intraday_bars(
@@ -439,7 +441,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 failures += 1
                 print(
                     "  ⚠ fewer than 6 sessions of history — the volume baseline "
-                    "needs more. Your FMP plan may cap intraday history."
+                    "needs more. Your provider or plan may cap intraday history."
                 )
         except ProviderError as exc:
             failures += 1
@@ -454,6 +456,28 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 if not outcome.startswith("ok"):
                     failures += 1
                 print(f"  [{mark}] {key}\n         {url}\n         {outcome}")
+        except ProviderError as exc:
+            failures += 1
+            print(f"  FAILED — {exc}")
+
+    if cfg.needs("option_volume"):
+        print(f"\n── {cfg.providers.option_volume.upper()} (option volume) ──")
+        try:
+            today, average, ratio = (
+                engine.Providers(cfg).ibkr.option_volume_ratio(ticker)
+            )
+            if today is None or average is None:
+                failures += 1
+                print(
+                    "  FAILED — the gateway answered but returned no option volume. "
+                    "Field ids move between builds; `providers.ibkr.fields` overrides them."
+                )
+            else:
+                print(f"  ok — {today:,.0f} contracts today vs {average:,.0f} average")
+                if ratio is not None:
+                    floor = float(cfg.detector("option_volume", ticker)["min_ratio"])
+                    verdict = "would alert" if ratio >= floor else "below the threshold"
+                    print(f"     {ratio:.2f}x — {verdict} (min_ratio {floor})")
         except ProviderError as exc:
             failures += 1
             print(f"  FAILED — {exc}")
