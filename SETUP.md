@@ -1,440 +1,491 @@
 # Setup, step by step
 
-From nothing to alerts landing on your phone. Follow it in order — each step is
-checkable, so you find out something is wrong at the step that broke it rather
-than three steps later.
+From nothing to alerts landing on your phone. Roughly 30 minutes, most of it
+waiting for accounts. Follow it in order — each step is checkable, so you find
+out something is wrong at the step that broke it rather than three steps later.
 
-Two things worth knowing before you start:
-
-- **You can try the whole thing before signing up for anything.** Steps 1–3 need
-  no keys and no Telegram bot. Skip ahead if you just want to look around.
-- **Every paid key is optional.** With none of them you still get SEC Form 4
-  insider alerts, which are free. Each key you add turns on more detectors.
-
-Time: about 10 minutes to try locally, about 30 to have it running on a box.
+**Steps 1 and 2 alone give you a working console with real alerts**, no accounts
+and no credentials. Start there.
 
 ---
 
-## Step 1 — Get the code running
+## Contents
 
-Needs Python 3.11 or newer.
+1. [Get the code running locally](#1-get-the-code-running-locally)
+2. [Try it before setting anything up](#2-try-it-before-setting-anything-up)
+3. [Choose your data sources](#3-choose-your-data-sources)
+4. [Telegram](#4-telegram)
+5. [SEC EDGAR](#5-sec-edgar-free)
+6. [Financial Modeling Prep](#6-financial-modeling-prep)
+7. [Interactive Brokers, for open interest](#7-interactive-brokers-for-open-interest)
+8. [Tune the thresholds to your tickers](#8-tune-the-thresholds-to-your-tickers)
+9. [Install it as a service](#9-install-it-as-a-service)
+10. [Day to day](#10-day-to-day)
+11. [When something breaks](#when-something-breaks)
+
+---
+
+## 1. Get the code running locally
+
+Python 3.11 or newer.
 
 ```bash
 git clone https://github.com/thewongdirection/stock-movement-monitor
 cd stock-movement-monitor
 
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-
+source .venv/bin/activate
 pip install -r requirements.txt
+
+cp config.example.yaml config.yaml
+export PYTHONPATH=src
 ```
 
-**Check it:**
+Check it imports and the schema is intact:
 
 ```bash
-PYTHONPATH=src python -m monitor --help
+python -m monitor params rvol
 ```
 
-You should see the command list. If Python complains about the version, check
-`python3 --version` — 3.10 and earlier will not work.
-
-> From here on every command starts with `PYTHONPATH=src python -m monitor`.
-> To shorten that to just `monitor`, run `pip install -e .` once.
+You should see `signals.volume.rvol_threshold` with its valid range. Every
+tunable setting is listed by `monitor params` with no argument.
 
 ---
 
-## Step 2 — Create your config
+## 2. Try it before setting anything up
+
+The monitor can replay captured market data, so you can see real alerts with no
+accounts at all.
 
 ```bash
-cp config.example.yaml config.yaml
+python -m monitor --config config.replay.yaml run --dry-run --as-of 2026-07-24T12:00:00
 ```
 
-Open `config.yaml` and put your tickers at the top. Leave everything else alone
-for now — every threshold has a documented default and you can tune them later
-from the bot.
+That prints genuine alerts built from real NVDA and MSFT bars and option chains.
+Then open the interactive surface — the same command set the Telegram bot
+exposes, with no bot token:
+
+```bash
+python -m monitor --config config.replay.yaml console
+```
+
+```
+> /status
+> /list
+> /params rvol
+> /set signals.volume.rvol_threshold 1.5 MSFT
+> /scan NVDA
+> /quit
+```
+
+If `/set signals.volume.rvol_threshold 99` gives you an error rather than a
+confirmation, everything is wired correctly — that refusal is deliberate.
+
+---
+
+## 3. Choose your data sources
+
+This decides which of the next four steps you need.
+
+| You want | Signal | Source | Cost |
+|---|---|---|---|
+| To know a position was **actually taken** | `open_interest` | IBKR gateway | Free with a funded IBKR account |
+| Insider buys and sells | `insider` | SEC EDGAR | Free |
+| Unusual volume for the time of day | `volume` | FMP **or** IBKR | FMP Starter, or free via IBKR |
+| CAN SLIM scorecards | — | FMP | Starter plan |
+| Alerts on your phone | — | Telegram | Free |
+
+**The recommended combination** is FMP for bars plus IBKR for option chains,
+which is what `config.example.yaml` ships with. If you would rather not pay for
+FMP, set `sources.bars: ibkr` and `canslim.enabled: false` — you lose the CAN
+SLIM scorecard and keep everything else.
+
+Edit `config.yaml`:
 
 ```yaml
-tickers:
+watchlist:
   - NVDA
-  - AAPL
-  - TSLA
+  - MSFT
+
+sources:
+  bars: fmp        # or ibkr
+  options: ibkr    # or off, if you skip step 7
+  insider: sec
+  trades: off
 ```
 
-**Check it:**
+Then create your credentials file:
 
 ```bash
-PYTHONPATH=src python -m monitor validate
+cp deploy/env.example .env
+chmod 600 .env
 ```
 
-This prints your tickers, which detectors are on, and — importantly — which
-environment variables are still missing. Expect it to list several right now;
-that is what the next steps fix. It exits non-zero on a real config error, so it
-is also what you would run in CI.
+Fill it in over the next four steps. `monitor verify` will tell you at any point
+which entries your particular configuration actually needs — it does not demand
+an FMP key when your bars come from IBKR.
 
 ---
 
-## Step 3 — Try the bot's whole command surface, with no bot
+## 4. Telegram
+
+**Get a bot token.** In Telegram, message [@BotFather](https://t.me/BotFather):
+
+```
+/newbot
+```
+
+Answer its two questions (a display name, then a username ending in `bot`). It
+replies with a token that looks like `1234567890:AAFakeTokenValue...`.
+
+**Get your chat id.** Send your new bot any message — say `hello`. It will not
+reply yet; that is expected, the bot is not running. Then open this URL in a
+browser, with your token pasted in:
+
+```
+https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
+```
+
+Find `"chat":{"id":987654321,...}`. That number is your chat id.
+
+> **You must message the bot first.** Telegram does not let a bot start a
+> conversation. Until you do, `getUpdates` returns an empty list and the monitor
+> reports that it cannot see the chat.
+
+Put both in `.env`:
+
+```
+TELEGRAM_BOT_TOKEN=1234567890:AAFakeTokenValue...
+TELEGRAM_CHAT_ID=987654321
+```
+
+Set `notify.channel: telegram` in `config.yaml`, then confirm:
 
 ```bash
-PYTHONPATH=src python -m monitor console
+python -m monitor verify
 ```
 
-This is the Telegram bot's entire command set, in your terminal, with no token
-and no network. Type `/help` for the list. Things worth trying:
-
-```
-/list                      your watchlist
-/levels                    the detection levels and what each needs
-/status                    market state, data-source health, missing keys
-/config volume_anomaly     current thresholds with allowed ranges
-/set volume_anomaly rvol_threshold 3
-/changes                   what you just changed vs the committed config
-/reset                     put it back
-```
-
-Buttons are numbered — type `1` to follow one.
-
-`/status` will tell you plainly that several data sources cannot be reached and
-that **silence from those detectors is not an all-clear.** That is the honest
-state of a monitor with no keys, and it is the point of the next step.
-
-Config changes you make here are real: they persist to `state/runtime.json` and
-the cron picks them up. `/reset` undoes them.
+Treat the bot token like a password — anyone holding it can send messages as
+your bot. The monitor itself only ever answers the one chat id you configured.
 
 ---
 
-## Step 4 — Add API keys for the detectors you want
+## 5. SEC EDGAR (free)
 
-Each key is optional and turns on specific detectors. Skip any you don't want.
+No key, no account. EDGAR asks that automated requests identify themselves, and
+blocks the ones that do not.
 
-| Key | Cost | Turns on | Where |
-|---|---|---|---|
-| `SEC_USER_AGENT` | free | `insider_trades` — Form 4 buys and sells | just your own email |
-| `FMP_API_KEY` | **paid — Starter or above** | `volume_anomaly` (L1) and CAN SLIM scorecards | [financialmodelingprep.com](https://site.financialmodelingprep.com/developer/docs) |
-| `UW_API_KEY` | paid | `dark_pool`, `block_trades` (L2), `options_flow` (L3) | [unusualwhales.com](https://unusualwhales.com/settings/api-dashboard) |
-| `ANTHROPIC_API_KEY` | pay per use | Claude writing the CAN SLIM judgement letters | [console.anthropic.com](https://console.anthropic.com/) |
-
-`SEC_USER_AGENT` is not really a key — SEC's fair-access policy asks for a
-contact address that reaches you. Use the real thing; a fake one gets you
-blocked, and the monitor refuses to send the example value.
-
-**On the FMP tier:** the price-history endpoints this project needs — intraday
-bars for L1, daily bars for the CAN SLIM technicals — sit behind FMP's Starter
-plan or above. A free key authenticates fine and then 403s on those endpoints,
-which `monitor verify` will show you as *"the key may lack entitlement for this
-endpoint, or your plan does not include it"*. So the genuinely free
-configuration is **insider alerts only**: keep `insider_trades` on and set
-`enabled: false` on everything else.
-
-```bash
-export SEC_USER_AGENT="stock-movement-monitor you@example.com"
-export FMP_API_KEY="..."
-export UW_API_KEY="..."
+```
+SEC_USER_AGENT=stock-movement-monitor you@example.com
 ```
 
-To keep them across shells, put them in a `.env` file (already gitignored) and
-`source .env`.
-
-**Check it:**
-
-```bash
-PYTHONPATH=src python -m monitor verify
-```
-
-This actually calls every endpoint and reports what answered. It is the step
-that catches a wrong key, a plan that doesn't include an endpoint, or a changed
-URL — and it tells you which config value to correct rather than making you read
-code.
+It must be an address that reaches you — the monitor refuses to start the SEC
+source without an `@`, because a bad user agent gets your IP blocked rather than
+producing an error you can read.
 
 ---
 
-## Step 5 — Do a dry run
+## 6. Financial Modeling Prep
 
-```bash
-PYTHONPATH=src python -m monitor run --dry-run --force
+Sign up at [financialmodelingprep.com](https://financialmodelingprep.com) and
+copy your key into `.env`:
+
+```
+FMP_API_KEY=...
 ```
 
-`--dry-run` prints alerts instead of sending them and leaves your state file
-untouched. `--force` runs the session-bound detectors even when the market is
-shut, so you can test outside trading hours.
+> **Plan requirement.** The endpoints this project uses — `historical-chart` for
+> intraday bars, and the statement endpoints for CAN SLIM — need the **Starter
+> plan or above**. A free key authenticates successfully and then returns an
+> entitlement error on exactly those calls. `monitor verify` reports it as such
+> rather than leaving you with a mysteriously empty watchlist.
 
-Read the output. You want to see either alerts, or an explanation of why there
-were none. Any provider that failed is listed under **Errors this run** with a
-message saying what to do about it.
+If you would rather not pay for FMP:
+
+```yaml
+sources:
+  bars: ibkr
+canslim:
+  enabled: false
+```
 
 ---
 
-## Step 6 — Set up the Telegram bot
+## 7. Interactive Brokers, for open interest
 
-1. In Telegram, message [@BotFather](https://t.me/BotFather) and send
-   `/newbot`. Follow the prompts; it gives you a token that looks like
-   `123456789:AAH...`.
-2. Export it, then **send your new bot any message** — it cannot find you until
-   you speak first:
+**This is the step that gets you the headline signal.** Open interest is the
+only figure in this project that shows a position was actually opened and held
+rather than merely traded, and IBKR is the one source at this price point that
+publishes it per contract.
 
-   ```bash
-   export TELEGRAM_BOT_TOKEN="123456789:AAH..."
-   PYTHONPATH=src python -m monitor telegram-chat-id
-   ```
+IBKR has no API key. It runs a **Client Portal Gateway** on your machine that
+proxies your own account, authenticated by a browser login.
 
-3. That prints your chat id. Export it:
-
-   ```bash
-   export TELEGRAM_CHAT_ID="987654321"
-   ```
-
-**Check it:**
+**Install and start the gateway:**
 
 ```bash
-PYTHONPATH=src python -m monitor test-alert
+mkdir -p ~/ibkr-gateway && cd ~/ibkr-gateway
+curl -O https://download2.interactivebrokers.com/portal/clientportal.gw.zip
+unzip clientportal.gw.zip
+./bin/run.sh root/conf.yaml
 ```
 
-A sample alert should arrive in Telegram. If it doesn't, the error message will
-say whether the token or the chat id was the problem.
+**Log in:** open <https://localhost:5000> in a browser. You will get a
+certificate warning — the gateway serves a self-signed certificate for
+`localhost`, which is why `ibkr.verify_tls` is `false` in the config. Accept it,
+sign in with your IBKR credentials, and complete two-factor if you use it.
 
-Only that one chat is served. The token is a bearer credential — anyone holding
-it could otherwise edit your watchlist.
+**Confirm the monitor can reach it:**
+
+```bash
+python -m monitor verify --raw
+```
+
+`--raw` prints one real contract row so you can check the open-interest figure
+came through. If it is empty, see
+[the field-id note](#open-interest-comes-back-empty) below.
+
+Three things to know about the gateway:
+
+- **The session expires**, roughly daily. When it does, the gateway keeps
+  answering with empty results rather than a clear error — which is why the
+  monitor checks `/iserver/auth/status` before every request and reports an
+  expired session as a source problem instead of a quiet market.
+- **Only one session at a time.** Logging into IBKR's website or TWS elsewhere
+  takes the session over, and the monitor reports that too.
+- **TLS verification is off for this source only**, and only because the
+  certificate is self-signed for localhost. If you ever point `ibkr.base_url` at
+  a remote host, turn `ibkr.verify_tls` back on.
+
+If you do not have an IBKR account, set `sources.options: off` and
+`signals.open_interest.enabled: false`. Everything else still works.
 
 ---
 
-## Step 7 — Optional: CAN SLIM scorecards on your alerts
+## 8. Tune the thresholds to your tickers
+
+Skipping this is the most common reason a monitor is either silent or
+unbearable.
+
+**Capture some real data:**
 
 ```bash
-git clone --depth 1 https://github.com/thewongdirection/can-slim-grader vendor/can-slim-grader
+python -m monitor capture
 ```
 
-That's it — grading turns itself on once the skill is on disk and `FMP_API_KEY`
-is set. Try it:
+That writes today's bars and option chain into `state/replay/`. Run it daily for
+a week to build history — or just use the NVDA and MSFT captures already in the
+repo.
+
+**See what the defaults would have fired on:**
 
 ```bash
-PYTHONPATH=src python -m monitor grade NVDA
+python -m monitor --config config.replay.yaml run --dry-run --as-of 2026-07-24T16:00:00
 ```
 
-You get a scorecard and a PDF. Read [what this actually
-grades](README.md#can-slim-scorecards) before relying on it: the letters are
-scored programmatically against the skill's published rubric, which is not the
-same as the skill's own agent judgement.
+**What to expect.** Measured over thirteen sessions of real 30-minute bars:
 
-**Optionally**, let Claude supply the judgement half — the per-letter commentary
-plus **N**'s "new" driver and **I**'s sponsorship quality:
+- NVDA crossed the default `rvol_threshold: 2.0` **twice**.
+- MSFT crossed it **not once**.
+- Sweeping `zscore_threshold` from 1.5 to 4.0 changed **nothing** — every bar
+  that cleared RVOL also cleared z. RVOL is the binding constraint; the z-score
+  is a guard against a distorted median, not a second opinion.
 
-```bash
-pip install -r requirements-narrator.txt
-export ANTHROPIC_API_KEY="sk-ant-..."
-PYTHONPATH=src python -m monitor grade NVDA --narrate --fresh
+The lesson is that one global number cannot serve both a volatile name and a
+quiet one. Use per-ticker overrides:
+
+```yaml
+overrides:
+  MSFT:
+    signals:
+      volume:
+        rvol_threshold: 1.6
+        min_price_move_pct: 0.35
 ```
 
-If you like it, turn it on for good with `/narrator llm` in the bot or
-`narrator: llm` under `canslim:` in `config.yaml`. It costs roughly $0.10–0.40
-per ticker per day and **cannot change a computed letter** — see [the
-narrator](README.md#the-narrator-optional).
+Or from chat, without editing the file:
+
+```
+/set signals.volume.rvol_threshold 1.6 MSFT
+```
+
+**Rules of thumb.** Too quiet: lower `rvol_threshold` first, then
+`min_price_move_pct`. Too noisy: raise `min_notional` before raising
+`rvol_threshold` — it cuts small prints without making you miss the big moves.
+For open interest, `min_oi_change_pct` is the scale-free knob; `min_oi_change`
+biases toward heavily traded names.
+
+`monitor params` lists every setting with its valid range. Values outside those
+ranges are clamped when they come from `config.yaml` — and reported, so you know
+it happened — but **refused** when typed into the bot.
 
 ---
 
-## Step 8 — Install it on the box
+## 9. Install it as a service
 
-The monitor runs as a **systemd timer** on a VPS or a machine at home. Not
-GitHub Actions: its scheduler drops runs under load, disables workflows after 60
-days idle, and cannot host an IBKR gateway. A €4/month VPS or a Pi on your desk
-does all three properly.
+On the machine that will run it:
 
 ```bash
 sudo ./deploy/install.sh
 ```
 
-That copies the tree to `/opt/stock-movement-monitor`, builds a virtualenv,
-writes a starter `config.yaml` and `.env` if they are missing (it never clobbers
-existing ones — re-run it after a `git pull`), and installs three units.
+The installer is idempotent — re-run it after a `git pull` and it picks up new
+units and dependencies without clobbering your `config.yaml`, your `.env`, or
+your state database.
 
-Then fill in your credentials and check before enabling anything:
+It installs to `/opt/stock-movement-monitor`, builds a virtualenv, writes
+starter config files if they do not exist, `chmod 600`s the `.env`, and installs
+three systemd units. **Nothing starts automatically** — it needs your
+credentials first.
 
 ```bash
-sudo -e /opt/stock-movement-monitor/.env          # keys
-sudo -e /opt/stock-movement-monitor/config.yaml   # tickers
+# 1. Copy your working config and credentials across
+sudo cp config.yaml /opt/stock-movement-monitor/config.yaml
+sudo cp .env        /opt/stock-movement-monitor/.env
+sudo chmod 600      /opt/stock-movement-monitor/.env
 
+# 2. Check it from where it will actually run
 cd /opt/stock-movement-monitor
 sudo -u $USER .venv/bin/python -m monitor verify
+
+# 3. Start the hourly poll
+sudo systemctl enable --now monitor.timer
+
+# 4. Optional: the Telegram bot, so you can talk to it
+sudo systemctl enable --now monitor-bot
 ```
 
-When `verify` is clean:
+Confirm:
 
 ```bash
-sudo systemctl enable --now monitor.timer     # hourly polling
-sudo systemctl enable --now monitor-bot       # optional: /list, /status, /grade
+systemctl list-timers monitor.timer     # when it next fires
+journalctl -u monitor -f                # what it is doing
+sudo systemctl start monitor            # poll right now, don't wait
 ```
 
-**Living with it:**
-
-| Command | What |
-|---|---|
-| `systemctl list-timers monitor.timer` | when it next fires, when it last did |
-| `journalctl -u monitor -f` | live log |
-| `journalctl -u monitor --since today` | today's polls |
-| `systemctl start monitor` | poll right now, don't wait for the hour |
-| `systemctl disable --now monitor.timer` | stop polling |
-
-**Why the timer fires hourly all day** rather than only during market hours:
-encoding 09:30–16:00 New York in a unit file means getting DST right in a second
-place, and getting it wrong means silently not polling for a week each spring.
-The application already knows the market calendar — holidays, half-days, early
-closes — and skips the session-bound detectors itself. It also means SEC Form 4
-filings, which land until roughly 22:00 ET, are still picked up in the evening.
-
-`Persistent=true` means a missed run fires on resume, so closing a laptop or
-rebooting the box catches up rather than silently skipping the window.
-
-## Step 8b — Optional: tune thresholds against a real session
-
-The defaults are conventional, not tailored to your names. Before trusting them,
-capture a session and replay it:
-
-```bash
-PYTHONPATH=src python -m monitor capture -o state/snapshot.json
-```
-
-That prints how many bars it got per ticker and the config block to paste. Make a
-`config.replay.yaml` from it:
-
-```yaml
-tickers: [NVDA]
-detectors:
-  volume_anomaly: {enabled: true, bar_interval: 30min}
-  block_trades: {enabled: false}
-  dark_pool: {enabled: false}
-  options_flow: {enabled: false}
-  option_volume: {enabled: false}
-  insider_trades: {enabled: false}
-run:
-  attach_canslim: false
-  cold_start_lookback_minutes: 400   # wide open, so every bar is a candidate
-providers:
-  bars: snapshot
-  snapshot: {path: state/snapshot.json}
-```
-
-Then replay any moment in it:
-
-```bash
-PYTHONPATH=src python -m monitor run -c config.replay.yaml \
-  --as-of 2026-07-22T11:31:00-04:00
-```
-
-Change `rvol_threshold`, run it again, and see what would have fired. Free, fast,
-repeatable. Two things to know: `--as-of` forces `--dry-run`, and it truncates the
-file at that clock so the replay cannot see its own future. `bar_interval` must
-match the interval you captured at.
-
-## Step 8c — Optional: unusual option activity via IBKR
-
-The one unusual-activity signal that needs no Unusual Whales subscription. It
-reads the **whole option chain against its own average**, pace-adjusted for how
-much of the session has run. No strike, no premium, no direction — but a genuine
-signal, and free with an IBKR account.
-
-IBKR has no API key. It talks to a Client Portal Gateway that must be running
-and *interactively logged in*, with a session that expires roughly daily. That
-is exactly why the monitor lives on a box you control — the gateway runs
-alongside it.
-
-1. **Get the gateway.** Download the Client Portal Gateway from IBKR, or run
-   their container image. It listens on `https://localhost:5000` with a
-   self-signed certificate, which this project expects.
-
-2. **Log in.** Open `https://localhost:5000` in a browser, accept the
-   certificate warning, and sign in with your IBKR credentials. You will need to
-   repeat this roughly daily — that is the operational cost of IBKR. Tools like
-   IBC can automate the re-login if you want it unattended.
-
-3. **Use the IBKR config.** It is kept separate from `config.yaml` so you can
-   fall back instantly — if the gateway is down or mid-re-auth, the plain config
-   still polls FMP and SEC without you editing anything:
-
-   ```bash
-   PYTHONPATH=src python -m monitor verify -c config.ibkr.yaml
-   ```
-
-   You want to see, for each ticker:
-
-   ```
-   ── IBKR (option volume) ──
-     ok — 2,452,910 contracts today vs 3,576,620 average
-        0.69x — below the threshold (min_ratio 2.5)
-   ```
-
-   A ratio below the threshold is the normal state. Most days are quiet.
-
-4. **Point a local cron at it.** On that machine:
-
-   ```
-   */5 * * * *  cd /path/to/stock-movement-monitor && PYTHONPATH=src \
-     .venv/bin/python -m monitor run -c config.ibkr.yaml >> state/cron.log 2>&1
-   ```
-
-`config.ibkr.yaml` also switches **bars** to IBKR — 30-second granularity, a real
-90-day dollar ADV, and no FMP plan tier to worry about. Change `bars` back to
-`fmp` if you would rather keep the gateway load down.
-
-## Step 9 — Run the bot when you want to talk to it
-
-The cron sends alerts on its own. Interactive commands only work while the bot
-process is running:
-
-```bash
-PYTHONPATH=src python -m monitor bot
-```
-
-Start it when you want to change something, or keep it up on a small always-on
-box. Everything you tried in the console in step 3 works here, plus `/grade` and
-`/history`.
+**Why the timer fires hourly all day**, rather than only during market hours:
+encoding 09:30–16:00 America/New_York in a unit file means getting daylight
+saving right in two places, and getting it wrong means silently not polling for
+a week each spring. The application already knows the market calendar —
+holidays, half days, early closes — and decides for itself what is meaningful.
+It also means Form 4 filings, which land until roughly 22:00 ET, are still
+picked up in the evening.
 
 ---
 
-## Where things live
+## 10. Day to day
 
-| Path | What |
-|---|---|
-| `config.yaml` | your reviewable baseline — commit it |
-| `state/runtime.json` | live edits made from the bot; `/reset` clears it |
-| `state/monitor.db` | dedup keys, watermarks, signal history |
-| `state/reports/` | generated CAN SLIM HTML and PDFs |
-| `state/snapshot.json` | captured bars for replay, if you made one |
-| `.env` | your keys, gitignored — never commit it |
+You should not have to do anything. When you do want to:
 
-`state/` is a plain directory on the box, so it simply persists — no cache to
-lose. If you do delete it, the monitor falls back to
-`run.cold_start_lookback_minutes` (150, comfortably more than the hourly poll
-gap) rather than replaying a whole day of alerts.
+```
+/status              is it alive, what has it seen lately
+/health              probe every source right now
+/scan NVDA           fetch fresh and evaluate immediately
+/grade NVDA          CAN SLIM scorecard
+/brief NVDA          a request to paste into the can-slim-grader skill
+/history             recent alerts
+/watch TSLA          add to the watchlist
+/set PATH VALUE      change a threshold; add a ticker to scope it
+/reset               undo every runtime change
+```
 
-Back it up if you care about the signal history `/history` reads; everything
-else in there rebuilds itself.
+Every one of these refetches. Nothing is answered from the last run's result.
+
+Changes made from chat live in `state/runtime.json` and apply from the next
+scheduled run. `config.yaml` is never rewritten by a machine, so the file you
+hand-edited stays the file you hand-edited.
+
+**Getting the full CAN SLIM picture.** The monitor computes the letters
+arithmetic can settle. For the two it cannot — the "new product or management"
+half of **N**, and institutional sponsorship **I** — run:
+
+```bash
+python -m monitor grade NVDA --brief
+```
+
+and paste the output into Claude with the
+[`can-slim-grader`](https://github.com/thewongdirection/can-slim-grader) skill
+installed. It arrives pre-loaded with everything the monitor already fetched, so
+the skill spends its effort on the judgement rather than re-deriving EPS growth.
+
+**Housekeeping.** The state database prunes itself when you ask:
+
+```bash
+sudo -u $USER /opt/stock-movement-monitor/.venv/bin/python -m monitor prune
+```
+
+Add it to a weekly cron if you like. It is not urgent — the database grows by a
+few kilobytes a day.
 
 ---
 
-## Troubleshooting
+## When something breaks
 
-**`monitor validate` says environment variables are not set.** That is a warning,
-not an error, and it lists exactly which detectors are affected. Detectors
-without their key stay silent.
+### Nothing has arrived for days
 
-**`monitor verify` reports a 404 on an Unusual Whales path.** Their API docs are
-not readable without an account, so the paths this ships with are best-effort.
-Correct the one that failed under `providers.unusual_whales.paths` in
-`config.yaml` — no code change needed.
+Check in this order:
 
-**No alerts at all during market hours.** Run `/status` in the bot. It will tell
-you when the last poll was, which sources are unreachable, and whether any feed
-looks frozen. If the last poll is hours old, the cron is the problem, not the
-market.
+```bash
+systemctl list-timers monitor.timer     # is the timer even enabled
+journalctl -u monitor --since today     # did the runs happen
+```
 
-**Alerts stopped and everything looks healthy.** That is the case this project
-worries about most, so there are specific checks for it: a feed that answers
-normally but never advances is reported as frozen after
-`run.max_feed_silence_minutes`, and the bot refuses to present records from a
-dead cron as current.
+If runs are happening and finding nothing, your thresholds are too high — see
+[step 8](#8-tune-the-thresholds-to-your-tickers). A `/scan NVDA` tells you
+immediately whether data is arriving.
 
-**`/grade` says PDF unavailable.** The HTML report is attached instead. Install a
-PDF engine if you want PDFs — the skill's `html_to_pdf.py` says which.
+### "Data source problems" in every message
 
-**The narrator is on but nothing is narrated.** The reason is printed on the
-report itself as a skip line, and `monitor grade TICKER --narrate --fresh` shows
-it directly. Most often: `ANTHROPIC_API_KEY` unset, or `anthropic` not installed.
+That block is the monitor telling you it could not see, rather than that it saw
+nothing. Read the line: it names the source, the ticker, and one of
+`unreachable`, `stale`, `corrupt`, `empty` or `unconfigured`.
+
+`monitor verify` probes everything and prints exactly what came back.
+
+### The IBKR session keeps expiring
+
+Expected — roughly daily. Re-open <https://localhost:5000> and sign in. If it
+happens more often, check whether you are logging into IBKR's website or TWS
+elsewhere; only one session can hold the connection.
+
+### Open interest comes back empty
+
+The gateway's market-data field ids have been renumbered between builds. Run:
+
+```bash
+python -m monitor verify --raw
+```
+
+If the sample row has no open-interest value, set `ibkr.oi_field` in
+`config.yaml` to the correct id for your build. The default is `"7638"`.
+
+### FMP returns an entitlement error
+
+The intraday and statement endpoints need the Starter plan. Either upgrade, or
+switch to `sources.bars: ibkr` and set `canslim.enabled: false`.
+
+### Telegram says it cannot see the chat
+
+Message your bot from your own Telegram account first. A bot cannot open a
+conversation, so until you do, the chat does not exist from its side.
+
+### Alerts stopped after a config change
+
+```bash
+python -m monitor validate
+```
+
+That reports hard errors and prints any value that was clamped for being out of
+range. A clamped threshold is the usual cause: the run continued, but not with
+the number you wrote.
+
+### I want to start over
+
+```
+/reset                                              # runtime changes only
+rm /opt/stock-movement-monitor/state/monitor.db     # dedup and history too
+```
+
+Deleting the database means the first run afterwards has no open-interest
+baseline, so the OI signal stays quiet for one day while it rebuilds. That is
+reported as a note, not an error.

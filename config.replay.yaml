@@ -1,39 +1,172 @@
-# Replay config — runs the real detectors against a captured file.
+# Demo configuration: every source replays the captured data in samples/.
+# Lets you see real alerts with no accounts and no credentials:
 #
-#   monitor capture -o state/snapshot.json
-#   monitor run -c config.replay.yaml --as-of 2026-07-22T11:31:00-04:00
+#   monitor --config config.replay.yaml run --dry-run --as-of 2026-07-24T12:00:00
+#   monitor --config config.replay.yaml console
 #
-# `--as-of` sets the run clock, truncates the file there so the replay cannot see
-# its own future, and forces --dry-run.
-tickers:
+# See config.example.yaml for the documented settings.
+
+# --------------------------------------------------------------------------- #
+# What to watch
+# --------------------------------------------------------------------------- #
+watchlist:
   - NVDA
   - MSFT
 
-detectors:
-  volume_anomaly:
+# --------------------------------------------------------------------------- #
+# Where data comes from
+#
+# bars      fmp | ibkr | replay   intraday OHLCV
+# options   ibkr | replay | off   option chains WITH open interest
+# insider   sec | replay | off    Form 4 filings
+# trades    replay | off          individual prints (block detection)
+#
+# FMP's intraday endpoint needs a Starter plan or above; the free tier returns
+# 403. IBKR needs the Client Portal Gateway running and logged in on this
+# machine. SEC EDGAR is free but requires SEC_USER_AGENT to be a real contact.
+# --------------------------------------------------------------------------- #
+sources:
+  bars: replay
+  options: replay
+  insider: replay
+  trades: off
+  replay_dir: samples/replay
+
+poll:
+  bar_minutes: 30           # FMP: 1, 5, 15, 30, 60, 240 only
+  baseline_sessions: 10     # prior sessions used to build the same-slot baseline
+  min_baseline_samples: 5   # below this the baseline is refused, not guessed
+  max_bar_age_minutes: 120  # older than this during market hours means stale data
+
+# --------------------------------------------------------------------------- #
+# Signals
+#
+# Ordered by how much they prove. open_interest is the only one that shows a
+# position was actually taken and held; volume is the most frequent and the
+# least conclusive.
+# --------------------------------------------------------------------------- #
+signals:
+
+  # Contracts that were opened and carried overnight. Once a day — the OCC
+  # settles open interest after the close, so there is nothing newer to fetch.
+  open_interest:
     enabled: true
-    bar_interval: 30min        # must match the snapshot's interval
-    baseline_sessions: 12
-  dark_pool:
+    min_oi_change: 500          # contracts
+    min_oi_change_pct: 20       # relative to the strike's existing open interest
+    min_notional: 250000        # contracts x 100 x strike
+    max_days_to_expiry: 120     # ignore LEAPS; they move on hedging, not conviction
+    top_n: 5
+
+  # Form 4. The only signal where direction is stated rather than inferred.
+  insider:
     enabled: true
-  block_trades:
-    enabled: true
-  options_flow:
-    enabled: true
-  option_volume:
-    enabled: true
-  insider_trades:
+    min_value: 100000
+    cluster_window_days: 30
+    cluster_min_buyers: 2
+    include_planned_sales: false   # 10b5-1 sales are scheduled months ahead
+    lookback_days: 7
+
+  # Individual large prints. Needs a tick feed; neither FMP nor the IBKR gateway
+  # has one, so this stays off until sources.trades points at captured data.
+  blocks:
     enabled: false
+    min_shares: 10000
+    min_notional: 200000
+    institutional_shares: 25000
+    institutional_notional: 1000000
+    mega_shares: 100000
+    mega_notional: 5000000
+    off_exchange_only: false
+    max_per_ticker: 5
 
-run:
-  attach_canslim: false
-  cold_start_lookback_minutes: 400   # wide open, so every bar is a candidate
-  min_severity: low
+  # Volume against the same clock slot on previous sessions.
+  #
+  # Measured on 13 sessions of real 30-minute bars: rvol_threshold is the
+  # binding constraint. Sweeping zscore_threshold from 1.5 to 4.0 changed
+  # nothing, because every bar that cleared RVOL also cleared z.
+  volume:
+    enabled: true
+    rvol_threshold: 2.0
+    zscore_threshold: 2.0
+    min_price_move_pct: 0.5
+    min_notional: 5000000
+    combine: all              # all | any
 
-providers:
-  bars: snapshot
-  trades: snapshot
-  flow: snapshot
-  option_volume: snapshot
-  snapshot:
-    path: state/snapshot.json
+# --------------------------------------------------------------------------- #
+# How much of the option chain to pull
+#
+# An unbounded chain on a liquid name is thousands of contracts and one request
+# per strike per right. These three bounds are what keep a daily pass to seconds.
+# --------------------------------------------------------------------------- #
+options:
+  strike_window_pct: 10
+  expiries: 3
+  max_contracts: 240
+
+# --------------------------------------------------------------------------- #
+# CAN SLIM
+#
+# narrator: off     deterministic scoring only, no API calls, no cost
+#           llm     Claude adds commentary and fills the letters arithmetic
+#                   cannot reach (N's "new" story, I's sponsorship quality)
+#           hybrid  as llm, and the narrator may also LOWER a computed grade
+#
+# The narrator can never RAISE a computed grade in any mode. Requires
+# ANTHROPIC_API_KEY and `pip install -r requirements-narrator.txt`.
+# --------------------------------------------------------------------------- #
+canslim:
+  enabled: false
+  attach_to_alerts: true
+  min_severity: medium      # attach a scorecard to alerts at or above this
+  narrator: off
+  model: claude-opus-5
+  cache_hours: 24           # fundamentals move quarterly
+
+# --------------------------------------------------------------------------- #
+# Notification
+# --------------------------------------------------------------------------- #
+notify:
+  channel: console         # telegram | console
+  min_severity: low         # low alerts arrive without buzzing the phone
+  max_per_run: 12
+  include_source_issues: true   # say when a feed is down; silence looks like calm
+
+health:
+  max_feed_silence_minutes: 180   # watchlist-wide non-advancement = frozen feed
+  fail_on_unreachable: false      # true makes systemd notice a dead source
+
+# --------------------------------------------------------------------------- #
+# Plumbing
+# --------------------------------------------------------------------------- #
+state:
+  path: state/replay-demo.db
+  retention_days: 45        # must exceed signals.insider.cluster_window_days
+
+http:
+  timeout_seconds: 20
+  retries: 3
+  backoff_seconds: 1.5
+
+ibkr:
+  base_url: https://localhost:5000/v1/api
+  verify_tls: false         # the gateway serves a self-signed localhost cert
+  volume_multiplier: 100    # the gateway reports bar volume in hundreds
+  oi_field: "7638"          # confirm with `monitor verify --raw` if OI is empty
+  option_volume_field: "7089"
+  snapshot_batch: 50
+
+# --------------------------------------------------------------------------- #
+# Per-ticker overrides
+#
+# One global threshold cannot serve every name. Over the same 13 sessions, NVDA
+# crossed rvol_threshold 2.0 twice and MSFT never crossed it at all — so a
+# single number either spams you about NVDA or never mentions MSFT.
+#
+# Any setting from above can be overridden per ticker.
+# --------------------------------------------------------------------------- #
+overrides:
+  MSFT:
+    signals:
+      volume:
+        rvol_threshold: 1.6
+        min_price_move_pct: 0.35

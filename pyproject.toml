@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stock-movement-monitor"
-version = "1.0.0"
-description = "Alerts on unusually large trades, options flow and insider filings for a watchlist"
+version = "2.0.0"
+description = "Hourly alerts when someone actually takes a position in a stock you watch"
 requires-python = ">=3.11"
 dependencies = ["requests>=2.32,<3", "PyYAML>=6.0,<7"]
 
 # The LLM narrator for the CAN SLIM scorecard. Optional on purpose: without it
-# the letters are still scored, just programmatically.
+# every letter arithmetic can settle is still scored, and the two it cannot are
+# reported as unmeasured rather than guessed.
 [project.optional-dependencies]
 narrator = ["anthropic>=0.120"]
 

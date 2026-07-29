@@ -1,213 +1,174 @@
-# ---------------------------------------------------------------------------
-# Stock movement monitor
+# stock-movement-monitor — configuration
 #
-# Copy to config.yaml and edit. Every threshold below is optional — omit it and
-# the documented default applies. Run `monitor explain` for the full reference
-# with allowed ranges, or `monitor validate` to check your edits.
+# Copy to config.yaml and edit. Every setting below is optional: anything you
+# leave out uses the built-in default, and `monitor params` prints the full list
+# with each one's valid range.
 #
-# Out-of-range values are clamped at run time and reported in a Telegram
-# footer, so a typo degrades the monitor instead of silently killing it.
-# `monitor validate` treats the same problem as a hard error — run it in CI.
-# ---------------------------------------------------------------------------
+# Out-of-range values in this file are clamped and reported at startup rather
+# than rejected, so a typo degrades the monitor instead of stopping it. The same
+# value typed into the chat bot is refused outright — see SETUP.md.
 
-tickers:
+# --------------------------------------------------------------------------- #
+# What to watch
+# --------------------------------------------------------------------------- #
+watchlist:
   - NVDA
-  - AAPL
-  - TSLA
   - MSFT
 
-# ---------------------------------------------------------------------------
-# Which signals to run. Each is independent — turn any of them off.
+# --------------------------------------------------------------------------- #
+# Where data comes from
 #
-#   volume_anomaly  L1       abnormal volume on aggregated bars     (needs FMP or IBKR)
-#   block_trades    L2       individual large prints                (needs UW)
-#   dark_pool       L2       off-exchange prints by value / %ADV    (needs UW)
-#   options_flow    L3       unusual options premium                (needs UW)
-#   option_volume   L3-lite  whole-chain option volume vs average   (needs IBKR gateway)
-#   insider_trades  Form 4   SEC filings                            (free)
+# bars      fmp | ibkr | replay   intraday OHLCV
+# options   ibkr | replay | off   option chains WITH open interest
+# insider   sec | replay | off    Form 4 filings
+# trades    replay | off          individual prints (block detection)
 #
-# Note: with Unusual Whales as the trades provider, block_trades and dark_pool
-# read the same off-exchange print stream and differ only in how they threshold
-# it. They will not double-alert on one print, but enabling just one gives the
-# cleanest results. dark_pool is the better default of the two.
-# ---------------------------------------------------------------------------
-detectors:
+# FMP's intraday endpoint needs a Starter plan or above; the free tier returns
+# 403. IBKR needs the Client Portal Gateway running and logged in on this
+# machine. SEC EDGAR is free but requires SEC_USER_AGENT to be a real contact.
+# --------------------------------------------------------------------------- #
+sources:
+  bars: fmp
+  options: ibkr
+  insider: sec
+  trades: off
+  replay_dir: state/replay
 
-  # ---- L1 -----------------------------------------------------------------
-  volume_anomaly:
+poll:
+  bar_minutes: 30           # FMP: 1, 5, 15, 30, 60, 240 only
+  baseline_sessions: 10     # prior sessions used to build the same-slot baseline
+  min_baseline_samples: 5   # below this the baseline is refused, not guessed
+  max_bar_age_minutes: 120  # older than this during market hours means stale data
+
+# --------------------------------------------------------------------------- #
+# Signals
+#
+# Ordered by how much they prove. open_interest is the only one that shows a
+# position was actually taken and held; volume is the most frequent and the
+# least conclusive.
+# --------------------------------------------------------------------------- #
+signals:
+
+  # Contracts that were opened and carried overnight. Once a day — the OCC
+  # settles open interest after the close, so there is nothing newer to fetch.
+  open_interest:
     enabled: true
-    bar_interval: 5min        # 1min | 5min | 15min
-    rvol_threshold: 2.0       # 2x normal is the standard "unusual" line
-    zscore_threshold: 3.0     # 3 sigma above the same-time-of-day mean
-    combine: all              # require both tests; "any" is far noisier
-    baseline_sessions: 20     # matches the usual 20-day average volume
-    min_bar_notional: 250000  # ignore thin bars
-    min_price_move_pct: 0.0   # optional confirmation; 0 = off
-    warmup_minutes: 5         # skip the opening auction distortion
-    cooldown_minutes: 60
+    min_oi_change: 500          # contracts
+    min_oi_change_pct: 20       # relative to the strike's existing open interest
+    min_notional: 250000        # contracts x 100 x strike
+    max_days_to_expiry: 120     # ignore LEAPS; they move on hedging, not conviction
+    top_n: 5
 
-  # ---- L2 -----------------------------------------------------------------
-  block_trades:
-    enabled: false            # dark_pool covers the same stream; see note above
-    preset: institutional     # classic (10k sh / $200k) | institutional | mega
-    combine: any
-    min_pct_of_adv: 0.25
-    off_exchange_only: false
-    cooldown_minutes: 15
-
-  dark_pool:
+  # Form 4. The only signal where direction is stated rather than inferred.
+  insider:
     enabled: true
-    min_notional: 1000000
-    min_pct_of_adv: 0.5
-    combine: any
-    cooldown_minutes: 15
-
-  # ---- L3 -----------------------------------------------------------------
-  options_flow:
-    enabled: true
-    min_premium: 100000       # the conventional "whale" floor
-    require_volume_gt_oi: true  # implies a newly opened position
-    trade_types: [sweep, block, split]
-    max_dte: 365              # long-dated flow is usually hedging
-    exclude_deep_itm_pct: 20.0
-    cooldown_minutes: 15
-
-  # ---- L3-lite ------------------------------------------------------------
-  # Coarser than options_flow — no strike, premium or direction, just "the whole
-  # chain is busier than normal". Costs nothing extra if you already run an IBKR
-  # gateway. Off by default because it needs one.
-  option_volume:
-    enabled: false
-    min_ratio: 2.5            # pace-adjusted for how much of the session has run
-    min_contracts: 5000
-    min_session_pct: 20.0     # these are day-cumulative figures; wait for a base
-    cooldown_minutes: 240
-
-  # ---- Form 4 -------------------------------------------------------------
-  insider_trades:
-    enabled: true
-    alert_on: [purchase, sale]   # add: exercise, grant, gift, tax, other
-    min_notional_purchase: 100000
-    min_notional_sale: 500000    # sales are noisier, so the bar is higher
-    exclude_10b5_1_sales: true   # pre-scheduled sales carry little signal
-    include_derivative: false
-    cluster_window_days: 30      # several insiders buying = strongest signal
-    cluster_min_insiders: 2
+    min_value: 100000
+    cluster_window_days: 30
+    cluster_min_buyers: 2
+    include_planned_sales: false   # 10b5-1 sales are scheduled months ahead
     lookback_days: 7
 
-# ---------------------------------------------------------------------------
-# Per-ticker overrides. Same settings, same bounds — only the keys you list
-# here are changed for that symbol.
-# ---------------------------------------------------------------------------
-overrides:
-  TSLA:
-    volume_anomaly:
-      rvol_threshold: 3.0     # habitually busy; needs a higher bar
-    dark_pool:
-      min_notional: 5000000
+  # Individual large prints. Needs a tick feed; neither FMP nor the IBKR gateway
+  # has one, so this stays off until sources.trades points at captured data.
+  blocks:
+    enabled: false
+    min_shares: 10000
+    min_notional: 200000
+    institutional_shares: 25000
+    institutional_notional: 1000000
+    mega_shares: 100000
+    mega_notional: 5000000
+    off_exchange_only: false
+    max_per_ticker: 5
 
-# ---------------------------------------------------------------------------
-# Run behaviour
-# ---------------------------------------------------------------------------
-run:
-  extended_hours: false           # also poll pre-market and after-hours
-  cold_start_lookback_minutes: 150 # cap on replay when state is lost;
-                                  # must exceed your polling interval
-  max_alerts_per_run: 25          # global circuit breaker
-  min_severity: low               # low | medium | high
-  state_retention_days: 30
+  # Volume against the same clock slot on previous sessions.
+  #
+  # Measured on 13 sessions of real 30-minute bars: rvol_threshold is the
+  # binding constraint. Sweeping zscore_threshold from 1.5 to 4.0 changed
+  # nothing, because every bar that cleared RVOL also cleared z.
+  volume:
+    enabled: true
+    rvol_threshold: 2.0
+    zscore_threshold: 2.0
+    min_price_move_pct: 0.5
+    min_notional: 5000000
+    combine: all              # all | any
 
-  # Data source health. A feed that stops working while still answering HTTP 200
-  # is the failure this project cares most about — silence reads as "nothing is
-  # happening" when it means "nobody is looking".
-  unresponsive_after: 3           # consecutive failures before reporting an outage
-  max_stale_intervals: 4          # bar intervals behind before the feed is "frozen"
-  max_feed_silence_minutes: 180   # no new prints/flow across the WHOLE watchlist.
-                                  # Set below your poll interval and a quiet feed
-                                  # is called frozen on every single run.
-
-  # CAN SLIM scorecards attached to alerts. Graded once per ticker and reused
-  # while still fresh, so a busy name costs one grade rather than one per alert.
-  attach_canslim: true
-  canslim_min_severity: medium    # don't grade every low-severity alert
-  canslim_max_age_minutes: 240    # re-grade rather than quote a stale price
-
-# ---------------------------------------------------------------------------
-# CAN SLIM grading
+# --------------------------------------------------------------------------- #
+# How much of the option chain to pull
 #
-# The scorecard itself is always computed from figures: EPS and sales growth,
-# ROE, relative strength, base depth, distribution days. Two letters cannot be
-# settled by arithmetic — N's "new" driver (a new product, management change or
-# industry condition) and I's sponsorship quality. Those are the narrator's job.
+# An unbounded chain on a liquid name is thousands of contracts and one request
+# per strike per right. These three bounds are what keep a daily pass to seconds.
+# --------------------------------------------------------------------------- #
+options:
+  strike_window_pct: 10
+  expiries: 3
+  max_contracts: 240
+
+# --------------------------------------------------------------------------- #
+# CAN SLIM
 #
-# narrator: off   letters scored programmatically; the qualitative halves of N
-#                 and I are flagged as ungraded rather than guessed. Free.
-# narrator: llm   Claude writes the per-letter commentary and judges N and I.
-#                 Needs ANTHROPIC_API_KEY and the optional `anthropic` package
-#                 (pip install anthropic). Roughly $0.10-0.40 and 30-90s per
-#                 ticker per day — grades are cached daily, so a busy name is
-#                 still charged once.
+# narrator: off     deterministic scoring only, no API calls, no cost
+#           llm     Claude adds commentary and fills the letters arithmetic
+#                   cannot reach (N's "new" story, I's sponsorship quality)
+#           hybrid  as llm, and the narrator may also LOWER a computed grade
 #
-# The narrator can NEVER change a computed letter. A score it proposes for C, A,
-# S, L or M is rejected, and the rejection is printed on the report itself. It
-# may set a score only for N, for I, or for a letter the computed pass left
-# `unknown` because data was missing. If it fails for any reason — no key, rate
-# limit, refusal, malformed output — you still get the full computed scorecard.
-# ---------------------------------------------------------------------------
+# The narrator can never RAISE a computed grade in any mode. Requires
+# ANTHROPIC_API_KEY and `pip install -r requirements-narrator.txt`.
+# --------------------------------------------------------------------------- #
 canslim:
-  narrator: off               # off | llm
-  narrator_model: claude-opus-5
-  narrator_effort: medium     # low | medium | high | xhigh | max
-  narrator_research: true     # web-search N's story and recent ownership news
-  narrator_max_tokens: 16000
-  narrator_fallbacks: true    # server-side reroute if a safety classifier declines
+  enabled: true
+  attach_to_alerts: true
+  min_severity: medium      # attach a scorecard to alerts at or above this
+  narrator: off
+  model: claude-opus-5
+  cache_hours: 24           # fundamentals move quarterly
 
-# ---------------------------------------------------------------------------
-# Providers
+# --------------------------------------------------------------------------- #
+# Notification
+# --------------------------------------------------------------------------- #
+notify:
+  channel: telegram         # telegram | console
+  min_severity: low         # low alerts arrive without buzzing the phone
+  max_per_run: 12
+  include_source_issues: true   # say when a feed is down; silence looks like calm
+
+health:
+  max_feed_silence_minutes: 180   # watchlist-wide non-advancement = frozen feed
+  fail_on_unreachable: false      # true makes systemd notice a dead source
+
+# --------------------------------------------------------------------------- #
+# Plumbing
+# --------------------------------------------------------------------------- #
+state:
+  path: state/monitor.db
+  retention_days: 45        # must exceed signals.insider.cluster_window_days
+
+http:
+  timeout_seconds: 20
+  retries: 3
+  backoff_seconds: 1.5
+
+ibkr:
+  base_url: https://localhost:5000/v1/api
+  verify_tls: false         # the gateway serves a self-signed localhost cert
+  volume_multiplier: 100    # the gateway reports bar volume in hundreds
+  oi_field: "7638"          # confirm with `monitor verify --raw` if OI is empty
+  option_volume_field: "7089"
+  snapshot_batch: 50
+
+# --------------------------------------------------------------------------- #
+# Per-ticker overrides
 #
-# The Unusual Whales paths below are the defaults this project ships with.
-# Their API documentation is not readable without an account, so if `monitor
-# verify` reports a 404 on one of these, correct the path here — no code change
-# is needed.
-# ---------------------------------------------------------------------------
-providers:
-  bars: fmp                 # fmp | ibkr
-  trades: unusual_whales
-  flow: unusual_whales
-  option_volume: ibkr
-  insider: sec_edgar
-  request_timeout: 30
-
-  unusual_whales:
-    base_url: https://api.unusualwhales.com
-    paths:
-      dark_pool_ticker: /api/darkpool/{ticker}
-      dark_pool_recent: /api/darkpool/recent
-      flow_alerts: /api/option-trades/flow-alerts
-      ticker_flow_alerts: /api/stock/{ticker}/flow-alerts
-      stock_ohlc: /api/stock/{ticker}/ohlc/{interval}
-      stock_info: /api/stock/{ticker}/info
-
-  # Interactive Brokers — finer bars (30-second), a real dollar ADV, and the
-  # option-volume signal. IBKR has NO API key: it needs a Client Portal Gateway
-  # running and interactively logged in, with a session that expires about daily.
-  # That works on a machine you control; it CANNOT work on a GitHub Actions
-  # runner, so leave base_url empty when running on the cron.
-  ibkr:
-    base_url: ""            # e.g. https://localhost:5000
-    history_volume_multiplier: 100   # CP history quotes stock volume in lots of 100
-    # Market-data field ids shift between gateway builds. `monitor verify`
-    # reports which ones answered; correct them here rather than in code.
-    fields: {}
-
-  # Replay a captured file instead of calling a provider. For tuning thresholds
-  # against a real session — see `monitor capture` and `monitor run --as-of`.
-  # Leaving this on in a committed config would mean you are not being alerted on
-  # a live market, so the run footer says loudly when a replay happened.
-  snapshot:
-    path: ""                # required when bars: snapshot
-
-  sec:
-    # SEC's fair-access policy requires a real contact address here.
-    # Overridden by the SEC_USER_AGENT environment variable.
-    user_agent: "stock-movement-monitor you@example.com"
+# One global threshold cannot serve every name. Over the same 13 sessions, NVDA
+# crossed rvol_threshold 2.0 twice and MSFT never crossed it at all — so a
+# single number either spams you about NVDA or never mentions MSFT.
+#
+# Any setting from above can be overridden per ticker.
+# --------------------------------------------------------------------------- #
+overrides:
+  MSFT:
+    signals:
+      volume:
+        rvol_threshold: 1.6
+        min_price_move_pct: 0.35

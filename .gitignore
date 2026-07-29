@@ -5,13 +5,13 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Local secrets — never commit
+# Credentials — never commit
 .env
 
-# Local state (CI keeps its own copy in the Actions cache)
+# Local state: the SQLite database, the runtime overlay written by the bot, and
+# anything `monitor capture` saves. Committed sample data lives in samples/.
 state/
 *.db
+*.db-wal
+*.db-shm
 *.db-journal
-
-# CAN SLIM skill, cloned by the workflow (and locally for development)
-vendor/

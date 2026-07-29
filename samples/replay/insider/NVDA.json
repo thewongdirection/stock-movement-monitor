@@ -1,0 +1,29 @@
+{
+ "filings": [
+  {
+   "insider": "DOE JANE",
+   "title": "Chief Financial Officer",
+   "code": "P",
+   "shares": 12000,
+   "price": 205.44,
+   "traded_on": "2026-07-21",
+   "filed_at": "2026-07-23T09:00:00-04:00",
+   "accession": "0001045810-26-000091",
+   "is_officer": true,
+   "shares_after": 148200,
+   "url": "https://www.sec.gov/Archives/edgar/data/1045810/x.html"
+  },
+  {
+   "insider": "SMITH ALAN",
+   "title": "Director",
+   "code": "P",
+   "shares": 4200,
+   "price": 203.1,
+   "traded_on": "2026-07-22",
+   "filed_at": "2026-07-24T10:30:00-04:00",
+   "accession": "0001045810-26-000094",
+   "is_director": true,
+   "shares_after": 31000
+  }
+ ]
+}

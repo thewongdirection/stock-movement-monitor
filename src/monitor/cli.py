@@ -1,15 +1,14 @@
-"""Command line interface.
+"""Command line entry points.
 
-    monitor console             the bot's commands locally, no Telegram needed
-    monitor bot                 run the Telegram bot (long-polling)
-    monitor grade TICKER        CAN SLIM scorecard + PDF for one ticker
-    monitor run                 one polling cycle (what the cron calls)
-    monitor validate            strict config check — exit 1 on any problem
-    monitor verify              live probe of every provider endpoint
-    monitor explain             the threshold reference, defaults and bounds
-    monitor test-alert          send a sample alert through Telegram
-    monitor telegram-chat-id    look up your chat id during setup
-    monitor state               what the state file currently holds
+`run` is what the systemd timer invokes. Everything else exists so that the
+things which normally go wrong — a wrong key, an expired IBKR session, a
+threshold nobody tuned — are discoverable before they turn into silence at
+10:05 on a Tuesday.
+
+Exit codes matter here, because systemd is the only thing watching: 0 success,
+1 an unhandled failure, 2 configuration that cannot be used, 3 a required data
+source was unreachable (only when `health.fail_on_unreachable` is set, so a
+flaky afternoon does not trip the restart limiter by default).
 """
 
 from __future__ import annotations
@@ -18,625 +17,412 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 
-from . import config as config_mod
-from . import engine
-from .bot.commands import BotContext
-from .canslim.service import CanSlimService
-from .runtime import Overlay
-from .models import Alert, Severity
-from .notify.base import ConsoleNotifier
-from .notify.telegram import TelegramNotifier
-from .params import ConfigError, reference_table
-from .providers.base import ProviderError
-from .providers.sec_edgar import is_placeholder_user_agent
-from .state import State
+from . import __version__
+from .canslim import CanSlim, brief, render
+from .canslim import status as canslim_status
+from .clock import ET, market_phase, now_et
+from .config import SCHEMA, ConfigError, Overlay, load, tunable_paths
+from .engine import Engine
+from .notify import build as build_notifier
+from .notify.base import format_alert, format_issues
+from .sources import ENV_VARS, build as build_sources, missing_credentials, write_bars, write_chain
+from .sources.base import SourceError
+from .store import Store
 
-DEFAULT_CONFIG = "config.yaml"
-DEFAULT_STATE = "state/monitor.db"
+log = logging.getLogger("monitor")
+
+EXIT_OK, EXIT_ERROR, EXIT_CONFIG, EXIT_SOURCE = 0, 1, 2, 3
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = _build_parser()
-    args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="monitor",
+        description="Watch a handful of stocks for movement that means somebody took a position.",
     )
-    # requests is chatty at DEBUG and drowns out everything useful.
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    parser.add_argument("--config", default="config.yaml", help="path to config.yaml")
+    parser.add_argument("--overlay", default="state/runtime.json",
+                        help="runtime overrides written by the chat bot")
+    parser.add_argument("-v", "--verbose", action="count", default=0)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    subs = parser.add_subparsers(dest="command", required=True)
 
-    try:
-        return args.handler(args)
-    except ConfigError as exc:
-        print(f"config error: {exc}", file=sys.stderr)
-        return 2
-    except ProviderError as exc:
-        print(f"provider error: {exc}", file=sys.stderr)
-        return 3
-    except KeyboardInterrupt:
-        return 130
+    run = subs.add_parser("run", help="one scheduled pass over the watchlist")
+    run.add_argument("--ticker", action="append", help="override the watchlist")
+    run.add_argument("--dry-run", action="store_true",
+                     help="print to the console and record nothing as sent")
+    run.add_argument("--as-of", help="replay position, ISO timestamp (replay sources only)")
 
+    subs.add_parser("validate", help="check config.yaml and stop")
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="monitor", description=__doc__)
-    parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
-    sub = parser.add_subparsers(dest="command", required=True)
+    verify = subs.add_parser("verify", help="probe every configured source now")
+    verify.add_argument("--ticker", help="probe with this ticker instead of the first watched")
+    verify.add_argument("--raw", action="store_true",
+                        help="dump one raw IBKR snapshot row, to confirm field ids")
 
-    def with_config(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
-        p.add_argument("-c", "--config", default=DEFAULT_CONFIG, help="path to config.yaml")
-        return p
+    subs.add_parser("console", help="interactive REPL over the bot command set")
+    subs.add_parser("bot", help="run the Telegram bot in the foreground")
 
-    run_p = with_config(sub.add_parser("run", help="one polling cycle"))
-    run_p.add_argument("-s", "--state", default=DEFAULT_STATE, help="path to the state db")
-    run_p.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="print alerts to stdout instead of sending them, and leave state untouched",
-    )
-    run_p.add_argument(
-        "--force",
-        action="store_true",
-        help="run session-bound detectors even when the market is closed",
-    )
-    run_p.add_argument(
-        "--overlay",
-        default=DEFAULT_OVERLAY,
-        help="runtime overlay written by the bot, merged over config.yaml",
-    )
-    run_p.add_argument(
-        "--no-grade",
-        action="store_true",
-        help="don't attach CAN SLIM scorecards, whatever run.attach_canslim says",
-    )
-    run_p.add_argument(
-        "--as-of",
-        metavar="TIMESTAMP",
-        help="run the clock at this ISO-8601 moment instead of now — for replaying "
-        "a snapshot through the session gate. Implies --dry-run.",
-    )
-    run_p.set_defaults(handler=cmd_run)
+    grade = subs.add_parser("grade", help="CAN SLIM scorecard for one ticker")
+    grade.add_argument("ticker")
+    grade.add_argument("--brief", action="store_true",
+                       help="print a paste-ready request for the can-slim-grader skill")
 
-    capture_p = with_config(
-        sub.add_parser("capture", help="save bars to a file for replay")
-    )
-    capture_p.add_argument(
-        "-o", "--out", default="state/snapshot.json", help="where to write it"
-    )
-    capture_p.set_defaults(handler=cmd_capture)
+    capture = subs.add_parser("capture", help="save current data for replay and testing")
+    capture.add_argument("--ticker", action="append", required=False)
+    capture.add_argument("--dir", default=None, help="defaults to sources.replay_dir")
 
-    validate_p = with_config(sub.add_parser("validate", help="strict config check"))
-    validate_p.set_defaults(handler=cmd_validate)
+    params = subs.add_parser("params", help="list tunable settings and their ranges")
+    params.add_argument("filter", nargs="?", default="")
 
-    verify_p = with_config(sub.add_parser("verify", help="probe provider endpoints"))
-    verify_p.add_argument(
-        "--ticker", default="", help="symbol to probe with (default: first configured)"
-    )
-    verify_p.set_defaults(handler=cmd_verify)
-
-    explain_p = sub.add_parser("explain", help="threshold reference")
-    explain_p.add_argument("detector", nargs="?", help="limit to one detector")
-    explain_p.add_argument("--markdown", action="store_true", help="emit markdown tables")
-    explain_p.set_defaults(handler=cmd_explain)
-
-    test_p = sub.add_parser("test-alert", help="send a sample alert")
-    test_p.set_defaults(handler=cmd_test_alert)
-
-    chat_p = sub.add_parser("telegram-chat-id", help="look up your chat id")
-    chat_p.set_defaults(handler=cmd_chat_id)
-
-    state_p = sub.add_parser("state", help="inspect the state file")
-    state_p.add_argument("-s", "--state", default=DEFAULT_STATE)
-    state_p.set_defaults(handler=cmd_state)
-
-    console_p = with_config(
-        sub.add_parser("console", help="the bot's commands locally, no Telegram")
-    )
-    console_p.add_argument("-s", "--state", default=DEFAULT_STATE)
-    console_p.add_argument(
-        "--script", default="", help='run semicolon-separated commands then exit'
-    )
-    console_p.add_argument("--no-colour", action="store_true")
-    console_p.set_defaults(handler=cmd_console)
-
-    bot_p = with_config(sub.add_parser("bot", help="run the Telegram bot"))
-    bot_p.add_argument("-s", "--state", default=DEFAULT_STATE)
-    bot_p.add_argument(
-        "--once", action="store_true", help="handle one batch of updates then exit"
-    )
-    bot_p.set_defaults(handler=cmd_bot)
-
-    grade_p = with_config(sub.add_parser("grade", help="CAN SLIM scorecard for a ticker"))
-    grade_p.add_argument("ticker")
-    grade_p.add_argument("--no-pdf", action="store_true", help="skip the PDF export")
-    grade_p.add_argument(
-        "--narrate",
-        action="store_true",
-        help="have Claude write the per-letter prose and judge N and I "
-        "(needs an Anthropic key; overrides canslim.narrator)",
-    )
-    grade_p.add_argument(
-        "--no-narrate",
-        action="store_true",
-        help="force the deterministic pass only, even if config enables the narrator",
-    )
-    grade_p.add_argument(
-        "--fresh",
-        action="store_true",
-        help="ignore today's cached grade and re-grade from scratch",
-    )
-    grade_p.set_defaults(handler=cmd_grade)
+    prune = subs.add_parser("prune", help="drop history past the retention window")
+    prune.add_argument("--dry-run", action="store_true")
 
     return parser
 
 
-DEFAULT_OVERLAY = "state/runtime.json"
-DEFAULT_REPORTS = "state/reports"
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+
+def cmd_run(args) -> int:
+    config = _load(args)
+    problems = config.validate()
+    if problems:
+        for problem in problems:
+            print(f"✗ {problem}", file=sys.stderr)
+        return EXIT_CONFIG
+    _warn(config)
+
+    as_of = datetime.fromisoformat(args.as_of).replace(tzinfo=ET) if args.as_of else None
+    store = Store(config.get("state.path"))
+    run_id = store.start_run()
+    try:
+        notifier, as_html = build_notifier(config, force_console=args.dry_run)
+        with build_sources(config, as_of=as_of) as sources:
+            engine = Engine(
+                config, store, sources,
+                canslim=CanSlim(config, store, fmp=sources.fundamentals),
+                now=as_of,
+            )
+            result = engine.run(args.ticker)
+
+        delivered = _deliver(result, notifier, as_html, config, store, args.dry_run)
+
+        for note in result.health.notes:
+            log.info("%s", note)
+        store.finish_run(
+            run_id, scanned=result.scanned, alerts=delivered,
+            issues=len(result.health.issues), ok=result.health.ok,
+            note=result.health.summary(),
+        )
+
+        print(
+            f"{result.scanned} scanned · {result.generated} generated · "
+            f"{delivered} sent · {result.duplicates} already seen · "
+            f"{len(result.health.issues)} source issues"
+            + (f" · {result.capped} above the per-run cap" if result.capped else "")
+        )
+        if result.health.issues and config.get("health.fail_on_unreachable"):
+            return EXIT_SOURCE
+        return EXIT_OK
+    finally:
+        store.close()
 
 
-def _bot_context(args: argparse.Namespace) -> BotContext:
-    """Assemble the shared context both front ends run on."""
-    overlay_path = Path(args.state).parent / "runtime.json"
-    overlay = Overlay.load(overlay_path)
-    cfg = config_mod.load(args.config, strict=False, overlay=overlay)
-    return BotContext(
-        config_path=Path(args.config),
-        state_path=Path(args.state),
-        overlay=overlay,
-        config=cfg,
-        canslim=_canslim(cfg),
-    )
+def _deliver(result, notifier, as_html, config, store, dry_run: bool) -> int:
+    """Send, then mark. In that order, so a failed send is retried next run."""
+    sent = 0
+    if result.health.issues and config.get("notify.include_source_issues"):
+        notifier.send(format_issues(result.health.issues, as_html=as_html))
+
+    for alert in result.alerts:
+        text = format_alert(alert, as_html=as_html,
+                            canslim=result.canslim.get(alert.ticker))
+        ok = (notifier.send(text, alert.severity)
+              if _accepts_severity(notifier) else notifier.send(text))
+        if not ok:
+            log.error("delivery failed for %s — will retry next run", alert.headline)
+            continue
+        sent += 1
+        if not dry_run:
+            store.mark_sent(alert)
+    return sent
 
 
-def _canslim(
-    cfg: config_mod.Config, want_pdf: bool = True, narrate: bool | None = None
-) -> CanSlimService:
-    from .canslim.narrate import config_from
-
-    narrator = config_from(cfg.canslim)
-    if narrate is not None:
-        narrator.enabled = narrate
-    return CanSlimService(
-        fmp_api_key=os.environ.get("FMP_API_KEY", ""),
-        fmp_base_url=cfg.providers.fmp_base_url,
-        cache_dir=os.environ.get("CANSLIM_REPORT_DIR", DEFAULT_REPORTS),
-        skill_path=os.environ.get("CANSLIM_SKILL_PATH") or None,
-        want_pdf=want_pdf,
-        narrator=narrator,
-    )
+def _accepts_severity(notifier) -> bool:
+    import inspect
+    try:
+        return "severity" in inspect.signature(notifier.send).parameters
+    except (TypeError, ValueError):
+        return False
 
 
-def cmd_console(args: argparse.Namespace) -> int:
-    from .bot.console import run_console
+def cmd_validate(args) -> int:
+    config = _load(args)
+    _warn(config)
+    problems = config.validate()
+    for problem in problems:
+        print(f"✗ {problem}")
+    missing = missing_credentials(config)
+    for name in missing:
+        print(f"✗ {name} is not set — {ENV_VARS.get(name, '')}")
 
-    ctx = _bot_context(args)
-    for issue in ctx.config.issues:
-        logging.warning("config: %s: %s", issue.path, issue.message)
-    return run_console(ctx, script=args.script or None, colour=not args.no_colour)
+    if problems or missing:
+        return EXIT_CONFIG
+    print(f"✓ config is usable — watching {', '.join(config.watchlist)}")
+    print(f"  signals: {', '.join(_enabled(config))}")
+    print(f"  sources: bars={config.get('sources.bars')} "
+          f"options={config.get('sources.options')} "
+          f"insider={config.get('sources.insider')} "
+          f"trades={config.get('sources.trades')}")
+    print(f"  {canslim_status()}")
+    return EXIT_OK
 
 
-def cmd_bot(args: argparse.Namespace) -> int:
-    from .bot.telegram_bot import TelegramBot
+def cmd_verify(args) -> int:
+    config = _load(args)
+    _warn(config)
+    ticker = (args.ticker or (config.watchlist[0] if config.watchlist else None))
+    if ticker is None:
+        print("✗ nothing to probe with — the watchlist is empty", file=sys.stderr)
+        return EXIT_CONFIG
+    ticker = ticker.upper()
 
-    ctx = _bot_context(args)
-    bot = TelegramBot(
-        token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-        chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
-        ctx=ctx,
-    )
-    if args.once:
-        handled = bot.poll_once()
-        print(f"handled {handled} update(s)")
+    print(f"Probing with {ticker} at {now_et():%Y-%m-%d %H:%M %Z} (market {market_phase()})\n")
+    for name, why in ENV_VARS.items():
+        state = "set" if os.environ.get(name) else "not set"
+        print(f"  {name:22} {state:8} {why}")
+    print()
+
+    failures = 0
+    with build_sources(config) as sources:
+        for issue in sources.issues:
+            print(f"  {issue.line()}")
+            failures += 1
+
+        probes = [
+            ("bars", sources.bars, lambda s: _describe_bars(s, ticker, config)),
+            ("options", sources.options, lambda s: _describe_chain(s, ticker, config, args.raw)),
+            ("insider", sources.insider, lambda s: _describe_filings(s, ticker, config)),
+            ("trades", sources.trades,
+             lambda s: f"{len(s.trades(ticker, now_et().replace(hour=0)))} prints today"),
+            ("fundamentals", sources.fundamentals,
+             lambda s: f"quote ${s.quote(ticker).get('price')}"),
+        ]
+        for role, source, probe in probes:
+            if source is None:
+                print(f"  — {role:13} not configured")
+                continue
+            try:
+                print(f"  ✓ {role:13} {source.name}: {probe(source)}")
+            except SourceError as exc:
+                print(f"  ✗ {role:13} {source.name}: {exc.kind} — {exc.detail}")
+                failures += 1
+            except Exception as exc:                # noqa: BLE001
+                print(f"  ✗ {role:13} {source.name}: {type(exc).__name__}: {exc}")
+                failures += 1
+
+    if config.get("notify.channel") == "telegram":
+        failures += _verify_telegram()
+
+    print()
+    print(f"  {canslim_status()}")
+    return EXIT_SOURCE if failures else EXIT_OK
+
+
+def _describe_bars(source, ticker, config) -> str:
+    bars = source.bars(ticker, config.get("poll.bar_minutes"),
+                       config.get("poll.baseline_sessions"))
+    newest = max(bar.ts for bar in bars)
+    return (f"{len(bars)} bars, newest {newest:%Y-%m-%d %H:%M %Z}, "
+            f"{len({bar.ts.date() for bar in bars})} sessions")
+
+
+def _describe_chain(source, ticker, config, raw: bool) -> str:
+    chain = source.chain(ticker, config.get("signals.open_interest.max_days_to_expiry"))
+    total = sum(contract.open_interest for contract in chain.contracts)
+    detail = (f"{len(chain.contracts)} contracts as of {chain.as_of}, "
+              f"{total:,} total open interest")
+    if raw and chain.contracts:
+        sample = chain.contracts[0]
+        detail += (f"\n      sample: {sample.label()} oi={sample.open_interest} "
+                   f"vol={sample.volume} (field {config.get('ibkr.oi_field')})")
+    return detail
+
+
+def _describe_filings(source, ticker, config) -> str:
+    from datetime import timedelta
+    since = now_et().date() - timedelta(days=config.get("signals.insider.lookback_days"))
+    filings = source.filings(ticker, since)
+    return f"{len(filings)} Form 4 lines since {since}"
+
+
+def _verify_telegram() -> int:
+    from .notify.telegram import TelegramNotifier
+    try:
+        notifier = TelegramNotifier(
+            os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+        )
+        info = notifier.verify()
+        chat = info["chat"]
+        print(f"  ✓ {'telegram':13} @{info['bot'].get('username')} → "
+              f"{chat.get('first_name') or chat.get('title')} ({chat.get('id')})")
         return 0
+    except Exception as exc:                        # noqa: BLE001
+        print(f"  ✗ {'telegram':13} {exc}")
+        return 1
+
+
+def cmd_console(args) -> int:
+    from .bot import Commands, repl
+    return repl(Commands(args.config, args.overlay))
+
+
+def cmd_bot(args) -> int:
+    from .bot import Commands, TelegramBot
+    bot = TelegramBot(
+        os.environ.get("TELEGRAM_BOT_TOKEN"),
+        os.environ.get("TELEGRAM_CHAT_ID"),
+        Commands(args.config, args.overlay),
+    )
+    log.info("bot started, polling for commands")
     return bot.run_forever()
 
 
-def cmd_grade(args: argparse.Namespace) -> int:
-    cfg = config_mod.load(args.config, strict=False)
-    narrate = True if args.narrate else (False if args.no_narrate else None)
-    service = _canslim(cfg, want_pdf=not args.no_pdf, narrate=narrate)
-    if args.fresh:
-        # Grades are cached once per ticker per day; --fresh is how you re-run
-        # after changing the narrator settings without waiting for tomorrow.
-        cache = service._cache_file(args.ticker.upper(), datetime.now())
-        cache.unlink(missing_ok=True)
-    outcome = service.grade(args.ticker.upper())
-    service.close()
-
-    if not outcome.ok:
-        print(f"could not grade {args.ticker.upper()}: {outcome.skipped}", file=sys.stderr)
-        return 1
-
-    report = outcome.report
-    assert report is not None
-    grade = report.grade
-    print(f"\n{grade.ticker} — {grade.company}")
-    print(f"  {grade.one_line()}")
-    print(f"  {grade.summary}\n")
-    for letter in grade.letters:
-        mark = {"pass": "PASS", "partial": "PART", "fail": "FAIL", "unknown": "????"}[letter.score]
-        print(f"  {letter.key}  {mark}  {letter.actual}")
-    print(f"\n  entry: {grade.entry}")
-    print(f"  stop:  {grade.stop}")
-    if grade.narrated:
-        print("\n  narrated by Claude:")
-        for note in grade.narrator_notes:
-            print(f"    · {note}")
-    for warning in grade.warnings:
-        print(f"  ! {warning}")
-    print(f"\n  HTML: {report.html_path}")
-    if report.has_pdf:
-        print(f"  PDF:  {report.pdf_path}")
-    elif report.pdf_error:
-        print(f"  PDF:  not produced — {report.pdf_error}")
-    return 0
-
-
-# --------------------------------------------------------------------------
-def cmd_run(args: argparse.Namespace) -> int:
-    # The overlay carries the bot's live edits. Loading it here is what makes a
-    # Telegram change take effect on the next cron tick without a commit.
-    overlay = Overlay.load(args.overlay)
-    cfg = config_mod.load(args.config, strict=False, overlay=overlay)
-    for issue in cfg.issues:
-        logging.warning("config: %s: %s", issue.path, issue.message)
-    for change in overlay.describe():
-        logging.info("overlay: %s", change)
-
-    now: datetime | None = None
-    dry_run = args.dry_run
-    if getattr(args, "as_of", None):
-        try:
-            now = datetime.fromisoformat(str(args.as_of).replace("Z", "+00:00"))
-        except ValueError:
-            print(
-                f"--as-of: {args.as_of!r} is not an ISO-8601 timestamp "
-                "(e.g. 2026-07-27T15:50:00-04:00)",
-                file=sys.stderr,
-            )
-            return 2
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
-        # A back-dated clock must never send. Alerts carry a time, and one stamped
-        # last Tuesday arriving on your phone today is worse than no alert.
-        dry_run = True
-        print(f"⏪ replay: running the clock at {now.isoformat()} (dry-run forced)\n")
-
-    notifier = ConsoleNotifier() if dry_run else _telegram()
-    state_path = ":memory:" if dry_run else args.state
-
-    canslim = None
-    if bool(cfg.run["attach_canslim"]) and not args.no_grade:
-        canslim = _canslim(cfg)
+def cmd_grade(args) -> int:
+    config = _load(args)
+    store = Store(config.get("state.path"))
     try:
-        with State(state_path) as state:
-            result = engine.run(
-                cfg, state, notifier, now=now, force=args.force, canslim=canslim
+        with build_sources(config) as sources:
+            if sources.fundamentals is None:
+                print("✗ CAN SLIM grading needs FMP_API_KEY", file=sys.stderr)
+                return EXIT_CONFIG
+            card = CanSlim(config, store, fmp=sources.fundamentals).card(
+                args.ticker.upper(), fresh=True
             )
+        if card is None:
+            print("✗ CAN SLIM is disabled in config", file=sys.stderr)
+            return EXIT_CONFIG
+        print(brief(card) if args.brief else render(card))
+        return EXIT_OK
     finally:
-        if canslim is not None:
-            canslim.close()
-
-    if result.replay_note:
-        print(f"\n⏪ {result.replay_note}")
-    print(f"\n{result.summary()} · {result.session_note}")
-    if not result.ran_session_detectors:
-        print("session-bound detectors were skipped; insider filings still checked")
-    for note in result.notes:
-        print(f"  note: {note}")
-    for error in result.errors:
-        print(f"  error: {error}", file=sys.stderr)
-
-    # A run that alerted successfully but hit a provider error is still a
-    # degraded run, and CI should show it as such.
-    return 0 if result.ok else 1
+        store.close()
 
 
-def cmd_capture(args: argparse.Namespace) -> int:
-    """Save the current bars to a file so a run can be replayed against them.
+def cmd_capture(args) -> int:
+    """Save today's data so it can be replayed, tested and swept against."""
+    config = _load(args)
+    target = Path(args.dir or config.get("sources.replay_dir"))
+    tickers = [t.upper() for t in (args.ticker or config.watchlist)]
+    if not tickers:
+        print("✗ nothing to capture", file=sys.stderr)
+        return EXIT_CONFIG
 
-    The point is threshold tuning: `rvol_threshold: 2.5` is a guess until you have
-    watched it against a real session, and you cannot iterate on a guess at one
-    cron tick every five minutes.
-    """
-    from .providers.snapshot import write_snapshot
-
-    cfg = config_mod.load(args.config, strict=False)
-    if cfg.providers.bars == "snapshot":
-        print(
-            "providers.bars is already 'snapshot' — capturing from a snapshot would "
-            "just copy it. Point bars at fmp or ibkr first.",
-            file=sys.stderr,
-        )
-        return 2
-
-    interval = str(cfg.detector("volume_anomaly")["bar_interval"])
-    providers = engine.Providers(cfg)
-    captured: dict[str, list] = {}
-    failures: list[str] = []
-    try:
-        for ticker in cfg.tickers:
-            try:
-                bars = providers.bars.intraday_bars(ticker, interval)
-            except ProviderError as exc:
-                failures.append(f"{ticker}: {exc}")
-                continue
-            if bars:
-                captured[ticker] = bars
-                span = f"{bars[0].ts:%Y-%m-%d} → {bars[-1].ts:%Y-%m-%d %H:%M %Z}"
-                print(f"  {ticker}: {len(bars):,} bars  {span}")
-            else:
-                failures.append(f"{ticker}: provider returned no bars")
-    finally:
-        providers.close()
-
-    for failure in failures:
-        print(f"  ! {failure}", file=sys.stderr)
-    if not captured:
-        print("nothing captured", file=sys.stderr)
-        return 1
-
-    path = write_snapshot(
-        args.out,
-        captured,
-        interval=interval,
-        source=f"{cfg.providers.bars} at capture time",
-        captured_at=datetime.now(timezone.utc),
-    )
-    print(f"\n✓ wrote {path} ({path.stat().st_size:,} bytes)")
-    print("\nTo replay it:")
-    print("  providers:\n    bars: snapshot\n    snapshot:\n      path: " + str(path))
-    print(f"  monitor run --as-of {captured[next(iter(captured))][-1].ts.isoformat()}")
-    return 0 if not failures else 1
-
-
-def cmd_validate(args: argparse.Namespace) -> int:
-    cfg = config_mod.load(args.config, strict=True)
-    print(f"✓ {args.config} is valid")
-    print(f"  tickers ({len(cfg.tickers)}): {', '.join(cfg.tickers)}")
-    enabled = cfg.enabled_detectors()
-    print(f"  detectors enabled: {', '.join(enabled) if enabled else 'none'}")
-    for name in enabled:
-        level = config_mod.DETECTOR_LEVEL[name]
-        print(f"    [{level}] {name}")
-    if cfg.overrides:
-        print("  per-ticker overrides:")
-        for ticker, per_det in cfg.overrides.items():
-            for det, settings in per_det.items():
-                pairs = ", ".join(f"{k}={v}" for k, v in settings.items())
-                print(f"    {ticker}.{det}: {pairs}")
-    missing = _missing_secrets(cfg)
-    if missing:
-        print("\n  ⚠ environment variables not set (needed at run time):")
-        for name, why in missing:
-            print(f"    {name} — {why}")
-    return 0
-
-
-def cmd_verify(args: argparse.Namespace) -> int:
-    cfg = config_mod.load(args.config, strict=False)
-    ticker = (args.ticker or cfg.tickers[0]).upper()
-    print(f"Probing providers with {ticker}\n")
-    failures = 0
-
-    if cfg.needs("bars"):
-        # Name whichever provider is configured. Reporting an IBKR gateway
-        # failure under an "FMP" heading sends you to the wrong place.
-        print(f"── {cfg.providers.bars.upper()} (intraday bars) ──")
-        try:
-            provider = engine.Providers(cfg).bars
-            bars = provider.intraday_bars(
-                ticker, str(cfg.detector("volume_anomaly", ticker)["bar_interval"])
-            )
-            sessions = sorted({b.ts.date() for b in bars})
-            adv = provider.average_daily_volume(bars, 20)
-            print(f"  ok — {len(bars)} bars across {len(sessions)} sessions")
-            if sessions:
-                print(f"     range {sessions[0]} .. {sessions[-1]}")
-            print(f"     average daily volume: {adv:,.0f}" if adv else "     ADV: n/a")
-            if len(sessions) < 6:
-                failures += 1
-                print(
-                    "  ⚠ fewer than 6 sessions of history — the volume baseline "
-                    "needs more. Your provider or plan may cap intraday history."
-                )
-        except ProviderError as exc:
-            failures += 1
-            print(f"  FAILED — {exc}")
-
-    if cfg.needs("trades") or cfg.needs("flow"):
-        print("\n── Unusual Whales ──")
-        print("  (paths are config values; correct any 404 under providers.unusual_whales)")
-        try:
-            for key, url, outcome in engine.Providers(cfg).uw.probe(ticker):
-                mark = "ok  " if outcome.startswith("ok") else "FAIL"
-                if not outcome.startswith("ok"):
-                    failures += 1
-                print(f"  [{mark}] {key}\n         {url}\n         {outcome}")
-        except ProviderError as exc:
-            failures += 1
-            print(f"  FAILED — {exc}")
-
-    if cfg.needs("option_volume"):
-        print(f"\n── {cfg.providers.option_volume.upper()} (option volume) ──")
-        try:
-            today, average, ratio = (
-                engine.Providers(cfg).ibkr.option_volume_ratio(ticker)
-            )
-            if today is None or average is None:
-                failures += 1
-                print(
-                    "  FAILED — the gateway answered but returned no option volume. "
-                    "Field ids move between builds; `providers.ibkr.fields` overrides them."
-                )
-            else:
-                print(f"  ok — {today:,.0f} contracts today vs {average:,.0f} average")
-                if ratio is not None:
-                    floor = float(cfg.detector("option_volume", ticker)["min_ratio"])
-                    verdict = "would alert" if ratio >= floor else "below the threshold"
-                    print(f"     {ratio:.2f}x — {verdict} (min_ratio {floor})")
-        except ProviderError as exc:
-            failures += 1
-            print(f"  FAILED — {exc}")
-
-    if cfg.needs("insider"):
-        print("\n── SEC EDGAR (Form 4) ──")
-        try:
-            sec = engine.Providers(cfg).sec
-            cik = sec.cik_for(ticker)
-            print(f"  ok — {ticker} maps to CIK {cik}")
-            since = (datetime.now(timezone.utc) - timedelta(days=90)).date()
-            filings = sec.recent_form4_filings(ticker, since)
-            print(f"  ok — {len(filings)} Form 4 filing(s) in the last 90 days")
-            if filings:
-                txns = sec.fetch_transactions(ticker, filings[0])
-                print(
-                    f"  ok — parsed {len(txns)} transaction line(s) from "
-                    f"{filings[0]['accessionNumber']}"
-                )
-                for txn in txns[:3]:
-                    value = f"${txn.notional:,.0f}" if txn.value_known else "no price stated"
-                    print(
-                        f"     {txn.transaction_code} {txn.shares:,.0f} sh · {value} "
-                        f"· {txn.insider_name}"
+    saved = 0
+    with build_sources(config) as sources:
+        for ticker in tickers:
+            if sources.bars is not None:
+                try:
+                    bars = sources.bars.bars(
+                        ticker, config.get("poll.bar_minutes"),
+                        config.get("poll.baseline_sessions"),
                     )
-        except ProviderError as exc:
-            failures += 1
-            print(f"  FAILED — {exc}")
+                    write_bars(target / "bars" / f"{ticker}.json",
+                               ticker, config.get("poll.bar_minutes"), bars)
+                    print(f"  ✓ {ticker} bars: {len(bars)}")
+                    saved += 1
+                except SourceError as exc:
+                    print(f"  ✗ {ticker} bars: {exc.detail}")
+            if sources.options is not None:
+                try:
+                    chain = sources.options.chain(
+                        ticker, config.get("signals.open_interest.max_days_to_expiry")
+                    )
+                    write_chain(target / "options" / f"{ticker}.json", chain)
+                    print(f"  ✓ {ticker} chain: {len(chain.contracts)} contracts "
+                          f"as of {chain.as_of}")
+                    saved += 1
+                except SourceError as exc:
+                    print(f"  ✗ {ticker} options: {exc.detail}")
 
-    print("\n── Telegram ──")
+    print(f"\nCaptured {saved} files into {target}")
+    return EXIT_OK if saved else EXIT_SOURCE
+
+
+def cmd_params(args) -> int:
+    needle = args.filter.lower()
+    shown = 0
+    for path in tunable_paths():
+        if needle and needle not in path.lower():
+            continue
+        print(f"{path}\n    {SCHEMA[path].describe()}")
+        shown += 1
+    if not shown:
+        print(f"No tunable settings match '{args.filter}'.")
+    return EXIT_OK
+
+
+def cmd_prune(args) -> int:
+    config = _load(args)
+    store = Store(config.get("state.path"))
     try:
-        _telegram()
-        print("  ok — token and chat id are set (use `test-alert` to send one)")
-    except ValueError as exc:
-        failures += 1
-        print(f"  FAILED — {exc}")
-
-    print(
-        f"\n{'✓ all probes passed' if not failures else f'✗ {failures} probe(s) need attention'}"
-    )
-    return 0 if not failures else 1
-
-
-def cmd_explain(args: argparse.Namespace) -> int:
-    names = [args.detector] if args.detector else list(config_mod.DETECTOR_SPECS)
-    for name in names:
-        specs = config_mod.DETECTOR_SPECS.get(name)
-        if specs is None:
-            print(f"unknown detector {name!r}", file=sys.stderr)
-            return 2
-        level = config_mod.DETECTOR_LEVEL[name]
-        rows = reference_table(specs)
-        if args.markdown:
-            print(f"\n#### `{name}` — {level}\n")
-            print("| Setting | Default | Allowed | What it does |")
-            print("|---|---|---|---|")
-            for setting, default, bounds, doc in rows:
-                print(f"| `{setting}` | `{default}` | {bounds} | {doc} |")
-        else:
-            print(f"\n=== {name} ({level}) ===")
-            for setting, default, bounds, doc in rows:
-                print(f"  {setting}")
-                print(f"      default: {default}   allowed: {bounds}")
-                print(f"      {doc}")
-    if not args.detector and args.markdown:
-        print("\n#### `block_trades` presets\n")
-        print("| Preset | min_shares | min_notional |")
-        print("|---|---|---|")
-        for preset, (sh, notional) in config_mod.BLOCK_PRESETS.items():
-            print(f"| `{preset}` | {sh:,} | ${notional:,.0f} |")
-    return 0
-
-
-def cmd_test_alert(args: argparse.Namespace) -> int:
-    notifier = _telegram()
-    alert = Alert(
-        ticker="TEST",
-        detector="volume_anomaly",
-        severity=Severity.MEDIUM,
-        headline="Sample alert — setup check",
-        occurred_at=datetime.now(timezone.utc),
-        lines=[
-            "RVOL <b>4.2×</b> normal for 10:35 ET · z-score <b>5.1</b>",
-            "Volume 1.8M vs 430.0K typical (20-session baseline)",
-            "Price ▲ +1.84% to $182.40 · ~$328.32M traded",
-            "<i>If you can read this, delivery works.</i>",
-        ],
-    )
-    ok = notifier.send(alert)
-    print("✓ sent" if ok else "✗ failed — see the error above")
-    return 0 if ok else 1
-
-
-def cmd_chat_id(args: argparse.Namespace) -> int:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    if not token:
-        print("TELEGRAM_BOT_TOKEN is not set.", file=sys.stderr)
-        return 2
-    notifier = TelegramNotifier(token, chat_id="0")
-    chats = notifier.resolve_chat_id()
-    if not chats:
-        print(
-            "No chats found. Send your bot a message (any text) in Telegram, "
-            "then run this again.\n"
-            "For a group, add the bot to the group and post a message there."
+        print("Before:", store.stats())
+        if args.dry_run:
+            print("(dry run — nothing deleted)")
+            return EXIT_OK
+        removed = store.prune(
+            config.get("state.retention_days"),
+            config.get("signals.insider.cluster_window_days"),
         )
-        return 1
-    print("Chats that have messaged this bot:")
-    for chat_id, name in chats:
-        print(f"  TELEGRAM_CHAT_ID={chat_id}   ({name})")
-    return 0
+        print("Removed:", removed)
+        print("After: ", store.stats())
+        return EXIT_OK
+    finally:
+        store.close()
 
 
-def cmd_state(args: argparse.Namespace) -> int:
-    path = Path(args.state)
-    if not path.exists():
-        print(f"no state file at {path} — the next run will create one")
-        return 0
-    with State(path) as state:
-        stats = state.stats()
-    print(f"{path} ({path.stat().st_size:,} bytes)")
-    for table, count in stats.items():
-        print(f"  {table}: {count:,}")
-    return 0
+# --------------------------------------------------------------------------- #
+# plumbing
+# --------------------------------------------------------------------------- #
+
+def _load(args):
+    return load(args.config, overlay=args.overlay)
 
 
-# --------------------------------------------------------------------------
-def _telegram() -> TelegramNotifier:
-    return TelegramNotifier(
-        token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-        chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+def _warn(config) -> None:
+    for warning in config.warnings:
+        print(f"⚠ {warning}", file=sys.stderr)
+
+
+def _enabled(config) -> list[str]:
+    return [
+        name for name in ("open_interest", "insider", "blocks", "volume")
+        if config.get(f"signals.{name}.enabled")
+    ] or ["none"]
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=[logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)],
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
     )
+    handler = globals()[f"cmd_{args.command}"]
+    try:
+        return handler(args)
+    except ConfigError as exc:
+        print(f"✗ configuration: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    except SourceError as exc:
+        print(f"✗ data source: {exc}", file=sys.stderr)
+        return EXIT_SOURCE
+    except KeyboardInterrupt:
+        return EXIT_OK
 
 
-def _missing_secrets(cfg: config_mod.Config) -> list[tuple[str, str]]:
-    wanted: list[tuple[str, str]] = [
-        ("TELEGRAM_BOT_TOKEN", "alert delivery"),
-        ("TELEGRAM_CHAT_ID", "alert delivery"),
-    ]
-    # Only FMP takes a key. An IBKR gateway authenticates interactively and a
-    # snapshot is a file, so asking for FMP_API_KEY in either case is noise that
-    # trains you to ignore this list.
-    if cfg.needs("bars") and cfg.providers.bars == "fmp":
-        wanted.append(("FMP_API_KEY", "intraday bars for the volume detector"))
-    if cfg.needs("trades") or cfg.needs("flow"):
-        wanted.append(("UW_API_KEY", "dark pool prints and options flow"))
-    if cfg.canslim.get("narrator") == "llm":
-        wanted.append(("ANTHROPIC_API_KEY", "CAN SLIM narration (canslim.narrator: llm)"))
-    ua = cfg.providers.sec_user_agent
-    if cfg.needs("insider") and (not ua or is_placeholder_user_agent(ua)):
-        wanted.append(
-            (
-                "SEC_USER_AGENT",
-                "SEC needs a real contact address; config.yaml still has the "
-                "example one",
-            )
-        )
-    return [(name, why) for name, why in wanted if not os.environ.get(name)]
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,760 +1,445 @@
-"""The seven letters, scored against the skill's published rubric.
+"""Deterministic CAN SLIM scoring, against the rubric the grader skill publishes.
 
-Thresholds come from ``references/data-and-scoring-guide.md`` in the
-can-slim-grader skill. Where a letter genuinely needs judgement the score says
-so instead of inventing one — see `UNKNOWN`.
+The thresholds here are not invented. They come from
+`can-slim-grader/references/data-and-scoring-guide.md` — 25% quarterly EPS and
+sales growth, three years of 25%+ annual growth, ROE 17%, relative strength
+beating the index, and so on — so a scorecard produced unattended on a server
+lines up with one produced by asking Claude to run the skill interactively.
 
-Scoring: pass = 1, partial = 0.5, fail = 0, out of 7. The verdict is *not* that
-score, though — per the guide it turns on the core letters (C, A, L) plus a
-valid N, because a high total built on the easy letters is exactly the mistake
-the methodology warns against.
+The important design choice is the fourth grade. A letter is PASS, PARTIAL,
+FAIL **or UNKNOWN**, and UNKNOWN is not a zero. Institutional sponsorship needs
+13F data; the "new product or management" half of N needs somebody to read the
+news. Scoring those as failures would quietly mark every stock down for the
+monitor's blind spots, and a 4/7 that is really "3 of 7 measured" is a lie with
+a decimal point on it. Unknown letters are excluded from the denominator and the
+coverage is stated on the card.
 """
 
 from __future__ import annotations
 
-import logging
 import statistics
 from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import Any
+from enum import Enum
 
-from ..models import Bar
-from .fundamentals import Fundamentals
-from .skill import SkillPaths, load_relative_strength
 
-log = logging.getLogger(__name__)
+class Grade(str, Enum):
+    PASS = "pass"
+    PARTIAL = "partial"
+    FAIL = "fail"
+    UNKNOWN = "unknown"
 
-PASS, PARTIAL, FAIL, UNKNOWN = "pass", "partial", "fail", "unknown"
+    @property
+    def points(self) -> float:
+        return {"pass": 1.0, "partial": 0.5, "fail": 0.0, "unknown": 0.0}[self.value]
 
-LETTER_NAMES = {
-    "C": "Current quarterly earnings & sales",
+    @property
+    def icon(self) -> str:
+        return {"pass": "✅", "partial": "🟡", "fail": "❌", "unknown": "❔"}[self.value]
+
+
+#: C, A and L carry more weight because they were the most predictive traits.
+WEIGHTS = {"C": 1.5, "A": 1.5, "L": 1.5, "N": 1.0, "S": 1.0, "I": 1.0, "M": 1.0}
+
+NAMES = {
+    "C": "Current quarterly earnings",
     "A": "Annual earnings growth",
-    "N": "New — and a new high off a base",
-    "S": "Supply & demand",
+    "N": "New high from a sound base",
+    "S": "Supply and demand",
     "L": "Leader, not laggard",
     "I": "Institutional sponsorship",
     "M": "Market direction",
 }
 
-#: An unknown letter is worth the same as a partial when totalling, because
-#: treating missing data as a failure would systematically avoid every name
-#: whose data happens to be plan-gated.
-POINTS = {PASS: 1.0, PARTIAL: 0.5, UNKNOWN: 0.5, FAIL: 0.0}
-
 
 @dataclass
-class LetterScore:
+class Letter:
     key: str
-    score: str
-    threshold: str
-    actual: str
-    read: str
+    grade: Grade
+    evidence: list[str] = field(default_factory=list)
 
     @property
     def name(self) -> str:
-        return LETTER_NAMES[self.key]
-
-    @property
-    def template_score(self) -> str:
-        """The template understands pass/partial/fail; unknown renders as partial."""
-        return PARTIAL if self.score == UNKNOWN else self.score
+        return NAMES[self.key]
 
 
 @dataclass
-class Grade:
+class Facts:
+    """Everything the grader can use. Every field is optional on purpose.
+
+    A partially available fact set produces a partially graded card that says so,
+    which is far more useful than refusing to grade or than guessing.
+    """
+
     ticker: str
-    company: str
-    as_of: str
-    price: float | None
-    letters: list[LetterScore]
+    price: float | None = None
+    #: Newest first, each {"eps": float, "revenue": float, "date": "YYYY-MM-DD"}
+    quarters: list[dict] = field(default_factory=list)
+    years: list[dict] = field(default_factory=list)
+    roe: float | None = None                     # fraction, e.g. 0.21
+    debt_to_equity: float | None = None
+    high_52w: float | None = None
+    low_52w: float | None = None
+    #: Daily closes, oldest first, for the stock and the index.
+    closes: list[float] = field(default_factory=list)
+    volumes: list[int] = field(default_factory=list)
+    index_closes: list[float] = field(default_factory=list)
+    shares_outstanding: float | None = None
+    institutional_holders: int | None = None
+    institutional_holders_prior: int | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Scorecard:
+    ticker: str
+    letters: list[Letter]
     verdict: str
-    tone: str
     summary: str
-    technicals: dict[str, Any] = field(default_factory=dict)
-    entry: str = "None now"
-    entry_note: str = ""
-    stop: str = ""
-    stop_note: str = ""
-    essentials: list[tuple[str, str]] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-    data_sources: str = "IBKR/FMP price + FMP fundamentals"
-
-    #: True once the LLM narrator has written the per-letter prose. The report
-    #: says which pass produced the letters, because they are not equivalent:
-    #: the computed pass cannot judge N's "new" story or I's sponsorship quality.
-    narrated: bool = False
-    #: Audit trail: every score the narrator set, and every one it proposed for a
-    #: computed letter and had rejected.
-    narrator_notes: list[str] = field(default_factory=list)
-    narrator_sources: list[dict] = field(default_factory=list)
+    score: float                 # weighted, over graded letters only
+    max_score: float
+    graded: int
+    notes: list[str] = field(default_factory=list)
 
     @property
-    def score(self) -> float:
-        return sum(POINTS[letter.score] for letter in self.letters)
+    def percent(self) -> float:
+        return self.score / self.max_score * 100 if self.max_score else 0.0
 
     @property
-    def score_text(self) -> str:
-        total = self.score
-        return f"{total:g} / 7"
+    def letter_grade(self) -> str:
+        pct = self.percent
+        for cut, mark in ((90, "A"), (80, "A-"), (70, "B+"), (60, "B"),
+                          (50, "B-"), (40, "C"), (25, "D")):
+            if pct >= cut:
+                return mark
+        return "F"
 
-    def letter(self, key: str) -> LetterScore | None:
+    def get(self, key: str) -> Letter | None:
         return next((letter for letter in self.letters if letter.key == key), None)
 
-    def one_line(self) -> str:
-        parts = " ".join(
-            f"{letter.key}{_mark(letter.score)}" for letter in self.letters
-        )
-        return f"{self.verdict} · {self.score_text} · {parts}"
+    def one_liner(self) -> str:
+        """The single line an alert attaches."""
+        coverage = "" if self.graded == 7 else f", {self.graded}/7 letters measurable"
+        return (f"CAN SLIM {self.letter_grade} ({self.percent:.0f}%{coverage}) — "
+                f"{self.verdict}")
 
 
-def _mark(score: str) -> str:
-    return {PASS: "✓", PARTIAL: "~", FAIL: "✗", UNKNOWN: "?"}[score]
+# --------------------------------------------------------------------------- #
+# per-letter scoring
+# --------------------------------------------------------------------------- #
+
+def _pct_change(now: float, then: float) -> float | None:
+    """Year-over-year growth. Undefined when the base is zero or negative.
+
+    A company going from a $2 loss to a $1 profit is not "150% growth", and
+    treating it as such is how loss-makers score like leaders.
+    """
+    if then is None or now is None or then <= 0:
+        return None
+    return (now - then) / then * 100
 
 
-# --------------------------------------------------------------------------
-def grade_ticker(
-    ticker: str,
-    *,
-    skill: SkillPaths,
-    daily: list[Bar],
-    weekly: list[Bar] | None,
-    benchmark_daily: list[Bar],
-    fundamentals: Fundamentals,
-    now: datetime | None = None,
-) -> Grade:
-    """Grade one ticker. Never raises on thin data — letters go unknown instead."""
-    now = now or datetime.now()
-    warnings = list(fundamentals.warnings)
+def score_c(facts: Facts) -> Letter:
+    """Latest quarter versus the *same quarter a year earlier*.
 
-    weekly = weekly or _to_weekly(daily)
-    technicals = _technicals(skill, ticker, daily, weekly, benchmark_daily, warnings)
-    market = _market_direction(benchmark_daily)
+    Four rows back, never the previous quarter. Sequential comparison makes
+    every seasonal business look like it is collapsing in Q1 and exploding in Q4.
+    """
+    quarters = facts.quarters
+    if len(quarters) < 5:
+        return Letter("C", Grade.UNKNOWN, ["fewer than 5 quarters of data available"])
 
-    letters = [
-        _score_c(fundamentals),
-        _score_a(fundamentals),
-        _score_n(technicals, fundamentals),
-        _score_s(technicals, fundamentals, daily),
-        _score_l(technicals),
-        _score_i(fundamentals),
-        _score_m(market),
+    eps_growth = _pct_change(quarters[0].get("eps"), quarters[4].get("eps"))
+    rev_growth = _pct_change(quarters[0].get("revenue"), quarters[4].get("revenue"))
+    if eps_growth is None and rev_growth is None:
+        return Letter("C", Grade.UNKNOWN, ["no usable earnings base a year ago"])
+
+    evidence = []
+    if eps_growth is not None:
+        evidence.append(f"EPS {eps_growth:+.0f}% YoY ({quarters[0].get('date', '?')})")
+    if rev_growth is not None:
+        evidence.append(f"Sales {rev_growth:+.0f}% YoY")
+
+    accelerating = None
+    if len(quarters) >= 6:
+        prior = _pct_change(quarters[1].get("eps"), quarters[5].get("eps"))
+        if prior is not None and eps_growth is not None:
+            accelerating = eps_growth > prior
+            evidence.append(
+                f"Growth {'accelerating' if accelerating else 'decelerating'} "
+                f"(prior quarter {prior:+.0f}%)"
+            )
+
+    strong = (eps_growth or 0) >= 25 and (rev_growth is None or rev_growth >= 25)
+    if strong and accelerating is not False:
+        return Letter("C", Grade.PASS, evidence)
+    if (eps_growth or 0) >= 10 or ((eps_growth or 0) >= 25 and accelerating is False):
+        return Letter("C", Grade.PARTIAL, evidence)
+    return Letter("C", Grade.FAIL, evidence)
+
+
+def score_a(facts: Facts) -> Letter:
+    years = facts.years
+    if len(years) < 4:
+        return Letter("A", Grade.UNKNOWN, ["fewer than 4 annual periods available"])
+
+    growth = [
+        _pct_change(years[i].get("eps"), years[i + 1].get("eps"))
+        for i in range(min(3, len(years) - 1))
     ]
+    known = [g for g in growth if g is not None]
+    if not known:
+        return Letter("A", Grade.UNKNOWN, ["annual EPS base is zero or negative"])
 
-    price = fundamentals.price or (daily[-1].close if daily else None)
-    verdict, tone, summary = _verdict(letters, technicals)
-    entry, entry_note, stop, stop_note = _entry_stop(verdict, technicals, market, price)
+    evidence = [f"Annual EPS growth: {', '.join(f'{g:+.0f}%' for g in known)}"]
+    if facts.roe is not None:
+        evidence.append(f"ROE {facts.roe * 100:.0f}%")
 
-    return Grade(
-        ticker=ticker.upper(),
-        company=_company_line(fundamentals),
-        as_of=(daily[-1].ts.date().isoformat() if daily else now.date().isoformat()),
-        price=price,
+    all_strong = len(known) >= 3 and all(g >= 25 for g in known)
+    roe_strong = facts.roe is not None and facts.roe >= 0.17
+    roe_ok = facts.roe is not None and facts.roe >= 0.12
+
+    if all_strong and roe_strong:
+        return Letter("A", Grade.PASS, evidence)
+    if all(g >= 10 for g in known) or roe_ok:
+        return Letter("A", Grade.PARTIAL, evidence)
+    return Letter("A", Grade.FAIL, evidence)
+
+
+def score_n(facts: Facts) -> Letter:
+    """The technical half only.
+
+    CAN SLIM's N is "a new product, management or industry condition **and** a
+    breakout to new highs from a sound base". Nothing here can read a press
+    release, so this scores the price half and says so — the narrator, or the
+    grader skill run interactively, supplies the other half.
+    """
+    if not facts.price or not facts.high_52w:
+        return Letter("N", Grade.UNKNOWN, ["no 52-week range available"])
+
+    off_high = (facts.high_52w - facts.price) / facts.high_52w * 100
+    evidence = [f"{off_high:.1f}% below the 52-week high of ${facts.high_52w:,.2f}"]
+
+    depth = _base_depth(facts.closes)
+    if depth is not None:
+        evidence.append(f"Recent base depth {depth:.0f}% "
+                        f"({'sound' if depth <= 33 else 'wide and loose'})")
+    evidence.append("The 'new product/management' half is not machine-readable — "
+                    "run the can-slim-grader skill for it")
+
+    if off_high <= 5 and (depth is None or depth <= 33):
+        return Letter("N", Grade.PASS, evidence)
+    if off_high <= 15:
+        return Letter("N", Grade.PARTIAL, evidence)
+    return Letter("N", Grade.FAIL, evidence)
+
+
+def score_s(facts: Facts) -> Letter:
+    """Is volume arriving on up days or down days?
+
+    Sessions are split by index, pairing each close with the volume printed the
+    same day. An earlier version filtered by value membership, which silently
+    collapsed any two sessions that happened to trade the same number of shares
+    and could report a stock with no down days at all.
+    """
+    if len(facts.volumes) < 40 or len(facts.closes) < 40:
+        return Letter("S", Grade.UNKNOWN, ["not enough daily history to judge volume"])
+
+    sessions = list(zip(facts.closes[-11:-1], facts.closes[-10:], facts.volumes[-10:]))
+    up = [volume for before, close, volume in sessions if close > before]
+    down = [volume for before, close, volume in sessions if close <= before]
+
+    base = facts.volumes[-60:-10] or facts.volumes[:-10]
+    median_base = statistics.median(base) if base else 0
+    if not median_base:
+        return Letter("S", Grade.UNKNOWN, ["no baseline volume to compare against"])
+
+    evidence = []
+    up_ratio = statistics.fmean(up) / median_base if up else None
+    down_ratio = statistics.fmean(down) / median_base if down else None
+    if up_ratio is not None:
+        evidence.append(f"Up-day volume {up_ratio:.2f}x the 3-month median ({len(up)} sessions)")
+    if down_ratio is not None:
+        evidence.append(f"Down-day volume {down_ratio:.2f}x ({len(down)} sessions)")
+    if facts.debt_to_equity is not None:
+        evidence.append(f"Debt/equity {facts.debt_to_equity:.2f}")
+    if facts.shares_outstanding:
+        evidence.append(f"{facts.shares_outstanding / 1e6:,.0f}M shares outstanding")
+
+    leveraged = facts.debt_to_equity is not None and facts.debt_to_equity >= 1.5
+
+    if not down:
+        evidence.append("No down day in the last 10 sessions")
+        return Letter("S", Grade.PARTIAL if leveraged else Grade.PASS, evidence)
+    if not up:
+        evidence.append("Every one of the last 10 sessions closed lower — this is distribution")
+        return Letter("S", Grade.FAIL, evidence)
+
+    if up_ratio > down_ratio * 1.2 and not leveraged:
+        return Letter("S", Grade.PASS, evidence)
+    if up_ratio >= down_ratio * 0.9:
+        return Letter("S", Grade.PARTIAL, evidence)
+    return Letter("S", Grade.FAIL, evidence)
+
+
+def score_l(facts: Facts) -> Letter:
+    """Relative strength against the index over the same window."""
+    rs = relative_strength(facts.closes, facts.index_closes)
+    if rs is None:
+        return Letter("L", Grade.UNKNOWN, ["no index series to compare against"])
+
+    stock, index, ratio = rs
+    evidence = [
+        f"Stock {stock:+.1f}% vs index {index:+.1f}% over the measured window",
+        f"Relative strength proxy {ratio:+.1f} points",
+    ]
+    if facts.low_52w and facts.price:
+        above_low = (facts.price - facts.low_52w) / facts.low_52w * 100
+        evidence.append(f"{above_low:.0f}% above the 52-week low")
+
+    if ratio >= 10:
+        return Letter("L", Grade.PASS, evidence)
+    if ratio >= -2:
+        return Letter("L", Grade.PARTIAL, evidence)
+    return Letter("L", Grade.FAIL, evidence)
+
+
+def score_i(facts: Facts) -> Letter:
+    if facts.institutional_holders is None:
+        return Letter("I", Grade.UNKNOWN,
+                      ["13F holder counts not available to the monitor"])
+    evidence = [f"{facts.institutional_holders:,} institutional holders"]
+    if facts.institutional_holders_prior:
+        change = facts.institutional_holders - facts.institutional_holders_prior
+        evidence.append(f"{change:+,} versus the prior quarter")
+        if change > 0:
+            return Letter("I", Grade.PASS, evidence)
+        if change == 0:
+            return Letter("I", Grade.PARTIAL, evidence)
+        return Letter("I", Grade.FAIL, evidence)
+    return Letter("I", Grade.PARTIAL, evidence)
+
+
+def score_m(facts: Facts) -> Letter:
+    """Market direction, from the index series alone.
+
+    Distribution-day counting needs index volume, which is not always fetched;
+    the 50/200-day structure is the part that is always computable.
+    """
+    closes = facts.index_closes
+    if len(closes) < 200:
+        return Letter("M", Grade.UNKNOWN, ["fewer than 200 index sessions available"])
+
+    last = closes[-1]
+    ma50 = statistics.fmean(closes[-50:])
+    ma200 = statistics.fmean(closes[-200:])
+    evidence = [
+        f"Index {last:,.2f}, 50-day {ma50:,.2f}, 200-day {ma200:,.2f}",
+    ]
+    if last > ma50 > ma200:
+        evidence.append("Confirmed uptrend — price above a rising 50 above the 200")
+        return Letter("M", Grade.PASS, evidence)
+    if last > ma200:
+        evidence.append("Under pressure — above the 200-day but not leading it")
+        return Letter("M", Grade.PARTIAL, evidence)
+    evidence.append("Correction — index below its 200-day average")
+    return Letter("M", Grade.FAIL, evidence)
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+
+def relative_strength(closes: list[float], index_closes: list[float]
+                      ) -> tuple[float, float, float] | None:
+    """Percentage gain of the stock and index over the same number of sessions.
+
+    Both series are truncated to the shorter one *from the right*, so the window
+    ends today for both. Aligning from the left would compare the stock's last
+    six months against the index's last twelve.
+    """
+    span = min(len(closes), len(index_closes))
+    if span < 20:
+        return None
+    stock = closes[-span:]
+    index = index_closes[-span:]
+    if stock[0] <= 0 or index[0] <= 0:
+        return None
+    stock_pct = (stock[-1] - stock[0]) / stock[0] * 100
+    index_pct = (index[-1] - index[0]) / index[0] * 100
+    return stock_pct, index_pct, stock_pct - index_pct
+
+
+def _base_depth(closes: list[float], window: int = 60) -> float | None:
+    """Peak-to-trough drawdown of the recent consolidation, as a percent."""
+    if len(closes) < window:
+        return None
+    recent = closes[-window:]
+    peak = max(recent)
+    trough = min(recent[recent.index(peak):]) if recent.index(peak) < len(recent) - 1 else min(recent)
+    return (peak - trough) / peak * 100 if peak else None
+
+
+# --------------------------------------------------------------------------- #
+# the card
+# --------------------------------------------------------------------------- #
+
+def grade(facts: Facts) -> Scorecard:
+    letters = [
+        score_c(facts), score_a(facts), score_n(facts), score_s(facts),
+        score_l(facts), score_i(facts), score_m(facts),
+    ]
+    known = [letter for letter in letters if letter.grade is not Grade.UNKNOWN]
+    score = sum(WEIGHTS[letter.key] * letter.grade.points for letter in known)
+    max_score = sum(WEIGHTS[letter.key] for letter in known)
+
+    verdict, summary = _verdict(letters, facts)
+    return Scorecard(
+        ticker=facts.ticker,
         letters=letters,
         verdict=verdict,
-        tone=tone,
         summary=summary,
-        technicals={**technicals, "market": market},
-        entry=entry,
-        entry_note=entry_note,
-        stop=stop,
-        stop_note=stop_note,
-        essentials=_essentials(fundamentals),
-        warnings=warnings,
+        score=score,
+        max_score=max_score,
+        graded=len(known),
+        notes=list(facts.notes),
     )
 
 
-# -- technicals -------------------------------------------------------------
-def _technicals(
-    skill: SkillPaths,
-    ticker: str,
-    daily: list[Bar],
-    weekly: list[Bar],
-    benchmark: list[Bar],
-    warnings: list[str],
-) -> dict[str, Any]:
-    """Run the skill's own relative_strength.py rather than reimplementing it."""
-    if not daily or not benchmark:
-        warnings.append("no price history — every technical letter is unknown")
-        return {}
-    try:
-        module = load_relative_strength(skill)
-        payload = {
-            "benchmark": {"symbol": "SPY", "daily": [_row(b) for b in benchmark]},
-            "candidates": [
-                {
-                    "symbol": ticker.upper(),
-                    "daily": [_row(b) for b in daily],
-                    "weekly": [_row(b) for b in weekly],
-                }
-            ],
-        }
-        result = module.analyze(payload)
-    except Exception as exc:  # noqa: BLE001 - a skill change must not break grading
-        warnings.append(f"relative_strength.py failed ({type(exc).__name__}: {exc})")
-        return {}
-
-    rows = result.get("candidates") if isinstance(result, dict) else None
-    if not rows:
-        return {}
-    row = rows[0] if isinstance(rows[0], dict) else {}
-    if len(daily) < 130:
-        warnings.append(
-            f"only {len(daily)} daily bars — the 6- and 12-month relative-strength "
-            "legs are incomplete, so RS is weaker evidence than usual"
-        )
-    return _normalise(row, daily)
-
-
-def _normalise(row: dict[str, Any], daily: list[Bar]) -> dict[str, Any]:
-    """Convert the skill's raw output into percentages, and derive the pivot.
-
-    ``relative_strength.py`` reports fractions (0.20 = 20%) and does not emit a
-    pivot price — it gives how far below the base peak the last close sits, from
-    which the peak (and therefore the buy point) follows.
-    """
-    base = row.get("base") or {}
-    below_peak = base.get("pct_below_base_peak")
-    last_close = daily[-1].close if daily else None
-
-    pivot = None
-    if last_close and below_peak is not None and below_peak < 1:
-        # below_peak = (peak - last) / peak  =>  peak = last / (1 - below_peak)
-        pivot = last_close / (1 - below_peak)
-
-    return {
-        "symbol": row.get("symbol"),
-        "rs_blend_pct": _to_pct(row.get("rs_blended")),
-        "rs_legs_pct": {
-            leg: _to_pct(value)
-            for leg, value in (row.get("rs_relative_return") or {}).items()
-        },
-        "off_high_pct": _to_pct(row.get("pct_off_52w_high")),
-        "breakout_vol_pct": _to_pct(row.get("breakout_vol_vs_avg")),
-        "base_depth_pct": _to_pct(base.get("base_depth_pct")),
-        "base_length_weeks": base.get("base_length_weeks"),
-        "pct_below_base_peak": _to_pct(below_peak),
-        "wide_loose": bool(base.get("wide_and_loose_flag")),
-        "pivot": pivot,
-        "last_close": last_close,
-    }
-
-
-def _to_pct(value: Any) -> float | None:
-    """The RS script speaks in fractions; the report and thresholds use percent."""
-    if value is None:
-        return None
-    try:
-        return float(value) * 100.0
-    except (TypeError, ValueError):
-        return None
-
-
-def _row(bar: Bar) -> list:
-    return [bar.ts.isoformat(), bar.open, bar.high, bar.low, bar.close, bar.volume]
-
-
-def _to_weekly(daily: list[Bar]) -> list[Bar]:
-    """Aggregate daily bars into weekly ones — saves a second API call."""
-    buckets: dict[tuple[int, int], list[Bar]] = {}
-    for bar in daily:
-        iso = bar.ts.isocalendar()
-        buckets.setdefault((iso[0], iso[1]), []).append(bar)
-    out: list[Bar] = []
-    for key in sorted(buckets):
-        week = sorted(buckets[key], key=lambda b: b.ts)
-        out.append(
-            Bar(
-                ts=week[0].ts,
-                open=week[0].open,
-                high=max(b.high for b in week),
-                low=min(b.low for b in week),
-                close=week[-1].close,
-                volume=sum(b.volume for b in week),
-            )
-        )
-    return out
-
-
-def _market_direction(benchmark: list[Bar]) -> dict[str, Any]:
-    """Classify M: confirmed uptrend / under pressure / correction.
-
-    Distribution day, per the standard definition: the index closes down at
-    least 0.2% on volume higher than the prior session. Five or more inside a
-    rolling 25-session window is the conventional warning threshold.
-    """
-    if len(benchmark) < 60:
-        return {"state": UNKNOWN, "label": "unknown", "detail": "not enough index history"}
-
-    closes = [b.close for b in benchmark]
-    ma50 = statistics.fmean(closes[-50:])
-    ma200 = statistics.fmean(closes[-200:]) if len(closes) >= 200 else None
-    last = closes[-1]
-
-    window = benchmark[-25:]
-    distribution = 0
-    for previous, current in zip(window, window[1:]):
-        if previous.close <= 0:
-            continue
-        drop = (current.close - previous.close) / previous.close * 100
-        if drop <= -0.2 and current.volume > previous.volume:
-            distribution += 1
-
-    above_50 = last > ma50
-    above_200 = ma200 is None or last > ma200
-
-    # Five distribution days in a 25-session window is the conventional warning
-    # level, six or more the serious one — so a trend is only "under pressure"
-    # from five, not from four.
-    if above_50 and above_200 and distribution <= 4:
-        state, label = PASS, "Confirmed uptrend"
-    elif above_200 and distribution <= 6:
-        state, label = PARTIAL, "Uptrend under pressure"
-    else:
-        state, label = FAIL, "Correction / downtrend"
-
-    return {
-        "state": state,
-        "label": label,
-        "detail": (
-            f"SPY {last:,.2f} vs 50-day {ma50:,.2f}"
-            + (f" / 200-day {ma200:,.2f}" if ma200 else "")
-            + f"; {distribution} distribution day(s) in 25 sessions"
-        ),
-        "distribution_days": distribution,
-    }
-
-
-# -- letters ----------------------------------------------------------------
-def _score_c(f: Fundamentals) -> LetterScore:
-    threshold = "EPS & sales up >=25% YoY, accelerating"
-    if not f.has_quarterly:
-        return LetterScore(
-            "C", UNKNOWN, threshold, "no quarterly data",
-            "Quarterly earnings could not be retrieved, so the most important "
-            "letter in the model is ungraded. Treat the whole verdict as "
-            "provisional until this is filled in.",
-        )
-
-    latest = next(q for q in f.quarters if q.eps_growth_yoy is not None)
-    eps_growth = latest.eps_growth_yoy
-    sales_growth = latest.revenue_growth_yoy
-
-    prior = [q for q in f.quarters if q.eps_growth_yoy is not None][1:2]
-    accelerating = bool(prior and eps_growth is not None and prior[0].eps_growth_yoy is not None
-                        and eps_growth > prior[0].eps_growth_yoy)
-
-    actual = f"EPS {_pct_text(eps_growth)}" + (
-        f", sales {_pct_text(sales_growth)}" if sales_growth is not None else ""
-    )
-
-    if eps_growth is None:
-        return LetterScore(
-            "C", UNKNOWN, threshold, actual,
-            "EPS grew from a negative or zero base, so a percentage would be "
-            "meaningless. Judge the absolute figures directly.",
-        )
-
-    sales_ok = sales_growth is not None and sales_growth >= 25
-    if eps_growth >= 25 and (sales_ok or (sales_growth or 0) >= 20):
-        score = PASS
-        read = (
-            f"Latest quarter EPS {_pct_text(eps_growth)} on sales "
-            f"{_pct_text(sales_growth)} — clears the 25% bar on both"
-            + (" and accelerating from the prior quarter." if accelerating else ".")
-        )
-    elif eps_growth >= 25:
-        score = PARTIAL
-        read = (
-            f"EPS {_pct_text(eps_growth)} clears the bar but sales "
-            f"{_pct_text(sales_growth)} lag it — margin-driven growth is weaker "
-            "evidence than demand-driven growth."
-        )
-    elif eps_growth >= 10:
-        score = PARTIAL
-        read = (
-            f"EPS {_pct_text(eps_growth)} is positive but short of the 25% the "
-            "model wants."
-        )
-    else:
-        score = FAIL
-        read = (
-            f"EPS {_pct_text(eps_growth)} — below 10%. This is the core earnings "
-            "letter, and it fails."
-        )
-    if score == PASS and not accelerating and prior:
-        read += " Growth is not accelerating quarter on quarter, which is the softer half of C."
-    return LetterScore("C", score, threshold, actual, read)
-
-
-def _score_a(f: Fundamentals) -> LetterScore:
-    threshold = "EPS up >=25%/yr for 3 yrs, ROE >=17%"
-    if not f.has_annual:
-        return LetterScore(
-            "A", UNKNOWN, threshold, "no annual data",
-            "Annual earnings history was unavailable, so multi-year consistency "
-            "is ungraded.",
-        )
-
-    growths = [y.eps_growth for y in f.years if y.eps_growth is not None][:3]
-    roe = f.latest_roe
-    actual = (
-        "EPS " + ", ".join(_pct_text(g) for g in growths) if growths else "EPS history thin"
-    ) + (f"; ROE {roe:.0f}%" if roe is not None else "; ROE n/a")
-
-    strong_years = [g for g in growths if g >= 25]
-    down_years = [g for g in growths if g < 0]
-
-    if len(growths) >= 3 and len(strong_years) == 3 and (roe or 0) >= 17:
-        score = PASS
-        read = (
-            "Three consecutive years of 25%+ EPS growth with ROE at "
-            f"{roe:.0f}% — the durable-growth profile the model is built on."
-        )
-    elif len(growths) >= 2 and all(g >= 10 for g in growths[:2]) and (roe is None or roe >= 12):
-        score = PARTIAL
-        read = (
-            "Annual growth is in the 10-25% band or ROE is between 12% and 17% — "
-            "respectable, short of the model's threshold."
-        )
-    elif down_years:
-        score = FAIL
-        read = (
-            f"{len(down_years)} down year(s) in the last three — erratic annual "
-            "earnings are a fail for A."
-        )
-    else:
-        score = FAIL
-        read = (
-            "Annual growth and/or ROE are below the model's floor "
-            f"({actual})."
-        )
-    return LetterScore("A", score, threshold, actual, read)
-
-
-def _score_n(technicals: dict[str, Any], f: Fundamentals) -> LetterScore:
-    threshold = "New driver + breakout to a new high from a sound base"
-    off_high = technicals.get("off_high_pct")
-    depth = technicals.get("base_depth_pct")
-    length = technicals.get("base_length_weeks")
-    loose = technicals.get("wide_loose")
-
-    if off_high is None:
-        return LetterScore(
-            "N", UNKNOWN, threshold, "no price history",
-            "Without price history neither the new-high test nor the base can be "
-            "assessed.",
-        )
-
-    actual = f"{off_high:.1f}% off 52-wk high"
-    if depth is not None:
-        actual += f", base {depth:.0f}% deep"
-    if length:
-        actual += f" over ~{length} wks"
-
-    # The "new product / management / condition" half of N is a qualitative
-    # judgement this deterministic pass cannot make. Say so rather than imply it.
-    caveat = (
-        " The 'new' half of N — a new product, management or industry condition — "
-        "is a qualitative call not made here; only the chart half is graded."
-    )
-
-    # N is "a new high *out of a sound base*". A stock at its high with no base
-    # behind it is extended, not breaking out — buying that is chasing, which is
-    # exactly what the methodology warns against. A usable base needs some
-    # length and some depth: roughly 4+ weeks and 8%+, and not wide and loose.
-    has_base = (
-        depth is not None
-        and length is not None
-        and length >= 4
-        and depth >= 8
-        and not loose
-    )
-
-    if off_high <= 5 and has_base:
-        score = PASS
-        read = (
-            f"Within {off_high:.1f}% of its 52-week high out of a base roughly "
-            f"{depth:.0f}% deep and {length} weeks long. The base is measured "
-            "heuristically, not pattern-classified." + caveat
-        )
-    elif off_high <= 5:
-        score = PARTIAL
-        read = (
-            f"At its highs ({off_high:.1f}% off) but with no sound base behind it"
-            + (
-                f" — the consolidation measures only {depth:.0f}% deep over "
-                f"{length} week(s)."
-                if depth is not None and length
-                else "."
-            )
-            + " That is an extended stock in a continuous run, not a breakout "
-            "from a base, so there is no proper pivot to buy against." + caveat
-        )
-    elif off_high <= 15:
-        score = PARTIAL
-        read = (
-            f"{off_high:.1f}% off the high — either extended from a pivot or "
-            "still repairing the base, so there is no clean buy point right now."
-            + caveat
-        )
-    else:
-        score = FAIL
-        read = (
-            f"{off_high:.1f}% below its 52-week high"
-            + (" in a wide, loose base." if loose else ".")
-            + " Not a breakout candidate."
-            + caveat
-        )
-    return LetterScore("N", score, threshold, actual, read)
-
-
-def _score_s(technicals: dict[str, Any], f: Fundamentals, daily: list[Bar]) -> LetterScore:
-    threshold = "Volume surging on up-moves, sane float, low debt"
-    breakout = technicals.get("breakout_vol_pct")
-    debt = f.debt_to_equity
-    bits = []
-    if breakout is not None:
-        bits.append(f"latest volume {_pct_text(breakout)} vs avg")
-    if debt is not None:
-        bits.append(f"debt/equity {debt:.2f}")
-    actual = "; ".join(bits) or "volume/float data thin"
-
-    if breakout is None:
-        return LetterScore(
-            "S", UNKNOWN, threshold, actual,
-            "Volume history was unavailable, so accumulation could not be judged.",
-        )
-
-    heavy_debt = debt is not None and debt > 2.0
-    if breakout >= 40 and not heavy_debt:
-        score = PASS
-        read = (
-            f"Latest session traded {_pct_text(breakout)} against its average — "
-            "the volume confirmation the model wants on a move."
-        )
-    elif breakout >= 0 and not heavy_debt:
-        score = PARTIAL
-        read = (
-            f"Volume {_pct_text(breakout)} versus average — present but not the "
-            "40-50% surge that marks real accumulation."
-        )
-    else:
-        score = FAIL
-        read = (
-            f"Volume {_pct_text(breakout)} versus average"
-            + (f" with debt/equity at {debt:.2f}." if heavy_debt else ".")
-            + " No sign of accumulation."
-        )
-    return LetterScore("S", score, threshold, actual, read)
-
-
-def _score_l(technicals: dict[str, Any]) -> LetterScore:
-    threshold = "RS clearly ahead of SPY; top of a strong group"
-    rs = technicals.get("rs_blend_pct")
-    if rs is None:
-        return LetterScore(
-            "L", UNKNOWN, threshold, "no RS available",
-            "Relative strength could not be computed, so leadership is ungraded.",
-        )
-
-    actual = f"RS proxy {rs:+.1f}pp vs SPY"
-    if rs >= 20:
-        score = PASS
-        read = (
-            f"Outperforming SPY by {rs:+.1f} percentage points on the blended "
-            "3/6/12-month proxy — "
-            "leadership, which is one of the three letters that carry the verdict."
-        )
-    elif rs >= -5:
-        score = PARTIAL
-        read = (
-            f"Roughly in line with SPY ({rs:+.1f}pp). The model wants leaders, not "
-            "market performers."
-        )
-    else:
-        score = FAIL
-        read = (
-            f"Lagging SPY by {rs:+.1f}pp. A laggard is what this methodology "
-            "explicitly avoids, however cheap it looks."
-        )
-    return LetterScore("L", score, threshold, actual, read)
-
-
-def _score_i(f: Fundamentals) -> LetterScore:
-    threshold = "Several quality funds, holder count increasing"
-    holders = f.institutional_holders
-    change = f.institutional_change
-    if holders is None:
-        return LetterScore(
-            "I", UNKNOWN, threshold, "ownership data unavailable",
-            "Institutional holder counts were not retrievable. The quality half "
-            "of I — whether the sponsors are funds worth following — needs "
-            "judgement this pass does not attempt.",
-        )
-    actual = f"{holders:,} holders" + (f" ({change:+,} QoQ)" if change is not None else "")
-    if change is not None and change > 0 and holders >= 100:
-        score = PASS
-        read = f"{holders:,} institutional holders and rising ({change:+,}) — sponsorship is building."
-    elif holders >= 50:
-        score = PARTIAL
-        read = (
-            f"{holders:,} holders but the count is flat or falling"
-            + (f" ({change:+,})." if change is not None else ".")
-        )
-    else:
-        score = FAIL
-        read = f"Only {holders:,} institutional holders — thin sponsorship."
-    return LetterScore("I", score, threshold, actual, read)
-
-
-def _score_m(market: dict[str, Any]) -> LetterScore:
-    threshold = "Confirmed uptrend in the general market"
-    state = market.get("state", UNKNOWN)
-    return LetterScore(
-        "M",
-        state,
-        threshold,
-        str(market.get("label", "unknown")),
-        f"{market.get('label', 'Unknown')} — {market.get('detail', 'no index data')}. "
-        "M is market-wide context; three quarters of stocks follow it.",
-    )
-
-
-# -- verdict ----------------------------------------------------------------
-def _verdict(letters: list[LetterScore], technicals: dict[str, Any]) -> tuple[str, str, str]:
+def _verdict(letters: list[Letter], facts: Facts) -> tuple[str, str]:
     by_key = {letter.key: letter for letter in letters}
-    core = [by_key[k].score for k in ("C", "A")]
-    leadership = by_key["L"].score
-    new_high = by_key["N"].score
-    market = by_key["M"].score
 
-    if FAIL in core:
-        failing = [k for k in ("C", "A") if by_key[k].score == FAIL]
-        return (
-            "AVOID",
-            "down",
-            f"Fails the core earnings letter{'s' if len(failing) > 1 else ''} "
-            f"{', '.join(failing)}. Strong price action alone is not enough "
-            "without earnings behind it.",
-        )
-    if leadership == FAIL:
-        return (
-            "AVOID",
-            "down",
-            "A laggard on relative strength. The method avoids beaten-down names "
-            "however cheap they look.",
-        )
-    if core.count(PASS) == 2 and leadership == PASS and new_high == PASS and market != FAIL:
-        return (
-            "BUY-RANGE",
-            "up",
-            "Passes C, A and L with a valid breakout setup. Do not chase more "
-            "than 5% past the pivot.",
-        )
-    if UNKNOWN in core:
-        return (
-            "WATCH",
-            "pressure",
-            "The earnings letters could not be graded on data, so no buy verdict "
-            "is possible. Fill in C and A before acting on this.",
-        )
-    missing = []
-    if new_high != PASS:
-        off = technicals.get("off_high_pct")
-        missing.append(
-            f"no valid buy point ({off:.1f}% off the high)" if off is not None
-            else "no valid buy point"
-        )
-    if market == FAIL:
-        missing.append("the general market is in a correction")
-    if leadership != PASS:
-        missing.append("relative strength is only in line with the market")
-    return (
-        "WATCH",
-        "pressure",
-        "Fundamentals hold up but " + "; ".join(missing) + "."
-        if missing
-        else "Fundamentals hold up but there is no actionable setup right now.",
-    )
+    def is_(key: str, *grades: Grade) -> bool:
+        return by_key[key].grade in grades
 
+    if is_("C", Grade.FAIL) or is_("A", Grade.FAIL) or is_("L", Grade.FAIL):
+        failing = [k for k in ("C", "A", "L") if is_(k, Grade.FAIL)]
+        return ("AVOID", (
+            f"Fails {' and '.join(failing)} — the letters that mattered most. "
+            "Strong price action without earnings behind it is not a CAN SLIM setup, "
+            "and a cheap laggard is exactly what the method avoids."
+        ))
 
-def _entry_stop(
-    verdict: str, technicals: dict[str, Any], market: dict[str, Any], price: float | None
-) -> tuple[str, str, str, str]:
-    """The framework's proposed entry and stop — a rule, not a recommendation."""
-    correction = market.get("state") == FAIL
-    stop_pct = 3.0 if correction else 8.0
-    stop_note = (
-        f"Cut {stop_pct:.0f}% below your buy"
-        + (" (tightened because the general market is in a correction)." if correction
-           else "; 3% in a market correction.")
-        + " No exceptions."
-    )
-
-    pivot = technicals.get("pivot")
-    if verdict == "BUY-RANGE" and pivot:
-        chase = pivot * 1.05
-        stop = pivot * (1 - stop_pct / 100)
-        return (
-            f"${pivot:,.2f} (pivot); buy up to +5% (${chase:,.2f})",
-            "Breakout above the base high needs volume +40-50%",
-            f"${stop:,.2f} (-{stop_pct:.0f}% from pivot)",
-            stop_note,
-        )
-
-    condition = (
-        "a follow-through day to confirm a new market uptrend"
-        if correction
-        else "a fresh base and a breakout on volume"
-    )
-    return (
-        "None now",
-        f"Needs {condition} before any entry is valid",
-        f"-{stop_pct:.0f}% from whatever your entry turns out to be",
-        stop_note,
-    )
-
-
-# -- presentation helpers ---------------------------------------------------
-def _company_line(f: Fundamentals) -> str:
-    bits = [f.company or f.ticker]
-    group = " / ".join(x for x in (f.sector, f.industry) if x)
-    if group:
-        bits.append(group)
-    return " - ".join(bits)
-
-
-def _essentials(f: Fundamentals) -> list[tuple[str, str]]:
-    rows: list[tuple[str, str]] = []
-    if f.market_cap:
-        rows.append(("Market cap", _big(f.market_cap)))
-    if f.pe_ratio:
-        rows.append(("P/E", f"{f.pe_ratio:,.1f}"))
-    if f.latest_roe is not None:
-        rows.append(("ROE", f"{f.latest_roe:,.0f}%"))
-    if f.debt_to_equity is not None:
-        rows.append(("Debt / equity", f"{f.debt_to_equity:,.2f}"))
-    if f.beta:
-        rows.append(("Beta", f"{f.beta:,.2f}"))
-    if f.institutional_holders:
-        rows.append(("Institutional holders", f"{f.institutional_holders:,}"))
-    if f.next_earnings:
-        rows.append(("Next earnings", f.next_earnings))
-    return rows
-
-
-def _pct_text(value: float | None) -> str:
-    return "n/a" if value is None else f"{value:+.0f}%"
-
-
-def _big(value: float) -> str:
-    for unit, size in (("T", 1e12), ("B", 1e9), ("M", 1e6)):
-        if abs(value) >= size:
-            return f"${value / size:,.2f}{unit}"
-    return f"${value:,.0f}"
-
-
-def today_key(now: datetime | date | None = None) -> str:
-    """Cache key: a CAN SLIM grade is a slow-moving, once-a-day fact."""
-    moment = now or datetime.now()
-    return (moment.date() if isinstance(moment, datetime) else moment).isoformat()
+    core_ok = is_("C", Grade.PASS) and is_("A", Grade.PASS) and is_("L", Grade.PASS)
+    if core_ok and is_("N", Grade.PASS) and not is_("M", Grade.FAIL):
+        return ("BUY-RANGE", (
+            "Passes the core earnings letters and leadership with a valid breakout. "
+            "The framework's own rules: do not chase more than 5% past the pivot, and "
+            "cut the loss at 7-8% below entry — 3% while the market is in correction."
+        ))
+    if is_("M", Grade.FAIL):
+        return ("WATCH", (
+            "The stock's own letters may hold up, but the general market is in a "
+            "correction, and three in four stocks follow the market down. Wait for a "
+            "follow-through day before acting."
+        ))
+    if is_("C", Grade.UNKNOWN) or is_("A", Grade.UNKNOWN):
+        return ("INCOMPLETE", (
+            "The earnings letters could not be measured from the available data, and "
+            "they are the ones that matter most. Run the can-slim-grader skill for a "
+            "full read before drawing a conclusion."
+        ))
+    return ("WATCH", (
+        "Fundamentals are respectable but there is no valid buy point right now — "
+        "either extended from a base or still repairing one. What needs to happen is "
+        "a new base and a breakout on volume."
+    ))

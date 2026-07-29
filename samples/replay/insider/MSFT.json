@@ -1,0 +1,17 @@
+{
+ "filings": [
+  {
+   "insider": "ROE RICHARD",
+   "title": "Director",
+   "code": "S",
+   "shares": 8000,
+   "price": 393.47,
+   "traded_on": "2026-07-22",
+   "filed_at": "2026-07-24T11:00:00-04:00",
+   "accession": "0000789019-26-000041",
+   "is_director": true,
+   "planned_10b5_1": true,
+   "shares_after": 42000
+  }
+ ]
+}

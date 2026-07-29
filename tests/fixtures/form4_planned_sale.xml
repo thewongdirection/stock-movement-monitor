@@ -1,57 +1,33 @@
 <?xml version="1.0"?>
 <ownershipDocument>
-    <schemaVersion>X0508</schemaVersion>
-    <documentType>4</documentType>
-    <periodOfReport>2026-07-25</periodOfReport>
-    <aff10b5One>1</aff10b5One>
-    <issuer>
-        <issuerCik>0000320193</issuerCik>
-        <issuerName>Test Corp</issuerName>
-        <issuerTradingSymbol>TEST</issuerTradingSymbol>
-    </issuer>
-    <reportingOwner>
-        <reportingOwnerId>
-            <rptOwnerName>Roe Richard</rptOwnerName>
-        </reportingOwnerId>
-        <reportingOwnerRelationship>
-            <isDirector>1</isDirector>
-            <isOfficer>1</isOfficer>
-            <isTenPercentOwner>0</isTenPercentOwner>
-            <officerTitle>Chief Financial Officer</officerTitle>
-        </reportingOwnerRelationship>
-    </reportingOwner>
-    <nonDerivativeTable>
-        <nonDerivativeTransaction>
-            <securityTitle>
-                <value>Common Stock</value>
-            </securityTitle>
-            <transactionDate>
-                <value>2026-07-25</value>
-            </transactionDate>
-            <transactionCoding>
-                <transactionFormType>4</transactionFormType>
-                <transactionCode>S</transactionCode>
-            </transactionCoding>
-            <transactionAmounts>
-                <transactionShares>
-                    <value>40000</value>
-                </transactionShares>
-                <transactionPricePerShare>
-                    <value>190.1000</value>
-                </transactionPricePerShare>
-                <transactionAcquiredDisposedCode>
-                    <value>D</value>
-                </transactionAcquiredDisposedCode>
-            </transactionAmounts>
-            <postTransactionAmounts>
-                <sharesOwnedFollowingTransaction>
-                    <value>85000</value>
-                </sharesOwnedFollowingTransaction>
-            </postTransactionAmounts>
-        </nonDerivativeTransaction>
-    </nonDerivativeTable>
-    <footnotes>
-        <footnote id="F1">Sale effected pursuant to a Rule 10b5-1 trading plan adopted on
-            2026-01-15.</footnote>
-    </footnotes>
+  <documentType>4</documentType>
+  <issuer>
+    <issuerTradingSymbol>MSFT</issuerTradingSymbol>
+  </issuer>
+  <reportingOwner>
+    <reportingOwnerId><rptOwnerName>ROE RICHARD</rptOwnerName></reportingOwnerId>
+    <reportingOwnerRelationship>
+      <isDirector>1</isDirector>
+      <isOfficer>0</isOfficer>
+      <isTenPercentOwner>0</isTenPercentOwner>
+    </reportingOwnerRelationship>
+  </reportingOwner>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <securityTitle><value>Common Stock</value></securityTitle>
+      <transactionDate><value>2026-07-24</value></transactionDate>
+      <transactionCoding><transactionCode>S</transactionCode></transactionCoding>
+      <transactionAmounts>
+        <transactionShares><value>8000</value></transactionShares>
+        <transactionPricePerShare><value>393.47</value></transactionPricePerShare>
+        <transactionAcquiredDisposedCode><value>D</value></transactionAcquiredDisposedCode>
+      </transactionAmounts>
+      <postTransactionAmounts>
+        <sharesOwnedFollowingTransaction><value>42000</value></sharesOwnedFollowingTransaction>
+      </postTransactionAmounts>
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+  <footnotes>
+    <footnote id="F1">This sale was made pursuant to a Rule 10b5-1 trading plan adopted on 2026-02-10.</footnote>
+  </footnotes>
 </ownershipDocument>

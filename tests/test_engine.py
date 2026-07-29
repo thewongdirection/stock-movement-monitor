@@ -1,482 +1,267 @@
-"""End-to-end run behaviour, driven with stub providers instead of a network."""
+"""Orchestration: fetch cadence, failure isolation, dedup and capping."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
-from conftest import (
-    NOW,
-    build_bars,
-    make_insider_txn,
-    make_option_trade,
-    make_trade,
-    spike_last_bar,
-)
+import pytest
 
-from monitor import config as config_mod, engine
-from monitor.market_calendar import ET
-from monitor.models import Alert, Severity
-from monitor.providers.base import ProviderError
+from monitor.clock import ET
+from monitor.engine import Engine
+from monitor.models import Severity
+from monitor.sources import SourceSet
+from monitor.sources.base import EmptyResponse, Unreachable
+
+from conftest import NOW, make_bars, make_chain, make_filing, spike
 
 
-class StubBars:
-    def __init__(self, bars=None, error: Exception | None = None):
-        self._bars = bars if bars is not None else build_bars()
+class FakeBars:
+    name = "fake-bars"
+
+    def __init__(self, bars=None, error=None):
+        self._bars = bars if bars is not None else []
         self._error = error
+        self.calls = 0
 
-    def intraday_bars(self, symbol, interval, lookback_days=45):
+    def bars(self, ticker, minutes, sessions):
+        self.calls += 1
         if self._error:
             raise self._error
         return self._bars
 
-    def average_daily_volume(self, bars, sessions, now=None):
-        return 10_000_000
 
-    def close(self):
-        pass
+class FakeOptions:
+    name = "fake-options"
 
-
-class StubUW:
-    def __init__(self, prints=None, flow=None, error: Exception | None = None):
-        self.prints = prints or []
-        self.flow = flow or []
+    def __init__(self, chain=None, error=None):
+        self._chain = chain
         self._error = error
+        self.calls = 0
 
-    def dark_pool_prints(self, ticker, limit=200):
+    def chain(self, ticker, max_days):
+        self.calls += 1
         if self._error:
             raise self._error
-        return self.prints
-
-    def flow_alerts(self, ticker, limit=200):
-        return self.flow
-
-    def close(self):
-        pass
-
-
-class StubSEC:
-    def __init__(self, txns=None):
-        self.txns = txns or []
-
-    def cik_for(self, ticker):
-        return "0000320193"
-
-    def recent_form4_filings(self, ticker, since):
-        return [{"accessionNumber": "a-1", "cik": "0000320193"}] if self.txns else []
-
-    def fetch_transactions(self, ticker, filing):
-        return self.txns
-
-    def close(self):
-        pass
-
-
-class StubProviders:
-    #: No snapshot in play, so no replay banner. Every provider bundle has to
-    #: answer this — a run that can't say whether it replayed is the bug.
-    replaying = None
-
-    def __init__(self, bars=None, uw=None, sec=None):
-        self.bars = bars or StubBars()
-        self.uw = uw or StubUW()
-        self.sec = sec or StubSEC()
-
-    def close(self):
-        pass
-
-
-class RecordingNotifier:
-    def __init__(self, fail: bool = False):
-        self.alerts: list[Alert] = []
-        self.summaries: list[str] = []
-        self.attachments: list = []
-        self.fail = fail
-
-    def send(self, alert, files=None):
-        if self.fail:
-            return False
-        self.alerts.append(alert)
-        self.attachments.extend(files or [])
-        return True
-
-    def send_summary(self, text):
-        self.summaries.append(text)
-        return True
-
-
-def config(**kwargs):
-    payload = {"tickers": ["TEST"], "detectors": {}, **kwargs}
-    return config_mod.from_dict(payload)
-
-
-def only(detector: str, **settings):
-    detectors = {
-        name: {"enabled": name == detector} for name in config_mod.DETECTOR_SPECS
-    }
-    detectors[detector].update(settings)
-    return config(detectors=detectors)
-
-
-# --------------------------------------------------------------------------
-def test_full_run_delivers_alerts_from_every_layer(state):
-    cfg = config(
-        detectors={
-            "volume_anomaly": {"enabled": True},
-            "block_trades": {"enabled": False},
-            "dark_pool": {"enabled": True, "min_pct_of_adv": 0},
-            "options_flow": {"enabled": True},
-            "insider_trades": {"enabled": True},
-        }
-    )
-    providers = StubProviders(
-        bars=StubBars(spike_last_bar(build_bars(), 6.0)),
-        uw=StubUW(
-            prints=[make_trade(size=50_000, price=100.0)],
-            flow=[make_option_trade()],
-        ),
-        sec=StubSEC([make_insider_txn(shares=5_000, price=100.0)]),
-    )
-    notifier = RecordingNotifier()
-
-    result = engine.run(cfg, state, notifier, now=NOW, providers=providers)
-
-    detectors = {a.detector for a in notifier.alerts}
-    assert detectors == {"volume_anomaly", "dark_pool", "options_flow", "insider_trades"}
-    assert result.ok
-    assert len(result.delivered) == 4
-
-
-def test_second_run_sends_nothing_new(state):
-    cfg = only("dark_pool", min_pct_of_adv=0, cooldown_minutes=0)
-    providers = StubProviders(uw=StubUW(prints=[make_trade(size=50_000, price=100.0)]))
-
-    first = engine.run(cfg, state, RecordingNotifier(), now=NOW, providers=providers)
-    assert len(first.delivered) == 1
-
-    second = engine.run(cfg, state, RecordingNotifier(), now=NOW, providers=providers)
-    assert second.delivered == []
-
-
-def test_failed_delivery_is_retried_on_the_next_run(state):
-    """A Telegram outage must not consume the alert."""
-    cfg = only("dark_pool", min_pct_of_adv=0, cooldown_minutes=0)
-    providers = StubProviders(uw=StubUW(prints=[make_trade(size=50_000, price=100.0)]))
-
-    broken = RecordingNotifier(fail=True)
-    first = engine.run(cfg, state, broken, now=NOW, providers=providers)
-    assert first.delivered == []
-    assert any("delivery failed" in e for e in first.errors)
-
-    working = RecordingNotifier()
-    second = engine.run(cfg, state, working, now=NOW, providers=providers)
-    assert len(second.delivered) == 1
-
-
-def test_market_closed_still_checks_insider_filings(state):
-    """Form 4s land on EDGAR long after the closing bell."""
-    cfg = config(
-        detectors={
-            "volume_anomaly": {"enabled": True},
-            "dark_pool": {"enabled": True},
-            "insider_trades": {"enabled": True},
-        }
-    )
-    providers = StubProviders(
-        bars=StubBars(spike_last_bar(build_bars(), 6.0)),
-        uw=StubUW(prints=[make_trade(size=50_000, price=100.0)]),
-        sec=StubSEC([make_insider_txn(shares=5_000, price=100.0)]),
-    )
-    notifier = RecordingNotifier()
-    saturday = datetime(2026, 7, 25, 12, 0, tzinfo=ET)
-
-    result = engine.run(cfg, state, notifier, now=saturday, providers=providers)
-
-    assert result.ran_session_detectors is False
-    assert {a.detector for a in notifier.alerts} == {"insider_trades"}
-
-
-def test_force_overrides_the_session_gate(state):
-    cfg = only("dark_pool", min_pct_of_adv=0)
-    saturday = datetime(2026, 7, 25, 12, 0, tzinfo=ET)
-    providers = StubProviders(
-        uw=StubUW(prints=[make_trade(size=50_000, price=100.0, now=saturday)])
-    )
-    result = engine.run(
-        cfg, state, RecordingNotifier(), now=saturday, providers=providers, force=True
-    )
-    assert len(result.delivered) == 1
-
-
-def test_one_provider_failure_does_not_stop_the_others(state):
-    cfg = config(
-        detectors={
-            "volume_anomaly": {"enabled": True},
-            "insider_trades": {"enabled": True},
-            "dark_pool": {"enabled": False},
-            "options_flow": {"enabled": False},
-        }
-    )
-    providers = StubProviders(
-        bars=StubBars(error=ProviderError("HTTP 401: authentication rejected")),
-        sec=StubSEC([make_insider_txn(shares=5_000, price=100.0)]),
-    )
-    notifier = RecordingNotifier()
-
-    result = engine.run(cfg, state, notifier, now=NOW, providers=providers)
-
-    assert {a.detector for a in notifier.alerts} == {"insider_trades"}
-    assert any("401" in e for e in result.errors)
-    assert result.ok is False
-
-
-def test_setup_failure_is_reported_once_not_once_per_ticker(state):
-    """A missing key is not a per-symbol problem and shouldn't read like one."""
-    from monitor.providers.base import SetupError
-
-    cfg = config_mod.from_dict(
-        {
-            "tickers": ["AAA", "BBB", "CCC"],
-            "detectors": {
-                name: {"enabled": name == "volume_anomaly"}
-                for name in config_mod.DETECTOR_SPECS
-            },
-        }
-    )
-    providers = StubProviders(bars=StubBars(error=SetupError("FMP_API_KEY is not set")))
-    result = engine.run(cfg, state, RecordingNotifier(), now=NOW, providers=providers)
-
-    assert len(result.errors) == 1
-    assert "unavailable" in result.errors[0]
-
-
-def test_per_ticker_fetch_failure_is_reported_per_ticker(state):
-    """A genuine per-symbol failure should still name each symbol."""
-    cfg = config_mod.from_dict(
-        {
-            "tickers": ["AAA", "BBB"],
-            "detectors": {
-                name: {"enabled": name == "volume_anomaly"}
-                for name in config_mod.DETECTOR_SPECS
-            },
-        }
-    )
-    providers = StubProviders(bars=StubBars(error=ProviderError("HTTP 404: not found")))
-    result = engine.run(cfg, state, RecordingNotifier(), now=NOW, providers=providers)
-
-    assert len(result.errors) == 2
-    assert any("AAA" in e for e in result.errors)
-    assert any("BBB" in e for e in result.errors)
-
-
-def test_min_severity_filters_quiet_alerts(state):
-    cfg = only("insider_trades")
-    cfg.run["min_severity"] = "high"
-    providers = StubProviders(
-        sec=StubSEC([make_insider_txn(code="S", shares=8_000, price=100.0, title="VP")])
-    )
-    result = engine.run(cfg, state, RecordingNotifier(), now=NOW, providers=providers)
-    assert result.delivered == []
-    assert result.below_threshold == 1
-
-
-def test_global_cap_limits_a_noisy_run(state):
-    cfg = only("dark_pool", min_pct_of_adv=0, max_alerts_per_run=50)
-    cfg.run["max_alerts_per_run"] = 3
-    prints = [
-        make_trade(size=30_000 + i * 5_000, price=100.0, raw_id=f"p{i}")
-        for i in range(10)
-    ]
-    providers = StubProviders(uw=StubUW(prints=prints))
-    result = engine.run(cfg, state, RecordingNotifier(), now=NOW, providers=providers)
-    assert len(result.delivered) == 3
-    assert result.capped == 7
-
-
-def test_config_warnings_are_surfaced_in_the_footer(state):
-    cfg = config_mod.from_dict(
-        {
-            "tickers": ["TEST"],
-            "detectors": {"dark_pool": {"enabled": True, "min_notional": 1}},
-        }
-    )
-    assert cfg.issues  # clamped below the allowed minimum
-    notifier = RecordingNotifier()
-    engine.run(cfg, state, notifier, now=NOW, providers=StubProviders())
-    assert notifier.summaries
-    assert "Config adjusted" in notifier.summaries[0]
-
-
-def test_no_footer_when_the_run_is_clean(state):
-    cfg = only("dark_pool", min_pct_of_adv=0)
-    providers = StubProviders(uw=StubUW(prints=[make_trade(size=50_000, price=100.0)]))
-    notifier = RecordingNotifier()
-    engine.run(cfg, state, notifier, now=NOW, providers=providers)
-    assert notifier.summaries == []
-
-
-def test_per_ticker_override_reaches_the_detector(state):
-    detectors = {name: {"enabled": False} for name in config_mod.DETECTOR_SPECS}
-    detectors["dark_pool"] = {"enabled": True, "min_pct_of_adv": 0}
-    cfg = config_mod.from_dict(
-        {
-            "tickers": ["TEST"],
-            "detectors": detectors,
-            "overrides": {"TEST": {"dark_pool": {"min_notional": 100_000_000}}},
-        }
-    )
-    providers = StubProviders(uw=StubUW(prints=[make_trade(size=50_000, price=100.0)]))
-    result = engine.run(cfg, state, RecordingNotifier(), now=NOW, providers=providers)
-    assert result.delivered == []
-
-
-def test_disabled_detectors_are_never_run(state):
-    cfg = config(
-        detectors={name: {"enabled": False} for name in config_mod.DETECTOR_SPECS}
-    )
-    result = engine.run(cfg, state, RecordingNotifier(), now=NOW, providers=StubProviders())
-    assert result.delivered == []
-    assert any("nothing to do" in n for n in result.notes)
-
-
-def test_delivered_alerts_are_ordered_most_severe_first(state):
-    cfg = only("insider_trades")
-    providers = StubProviders(
-        sec=StubSEC(
-            [
-                make_insider_txn(code="S", shares=8_000, price=100.0, title="VP", accession="a-1"),
-                make_insider_txn(code="P", shares=30_000, price=100.0, accession="a-2"),
-            ]
-        )
-    )
-    result = engine.run(cfg, state, RecordingNotifier(), now=NOW, providers=providers)
-    assert [a.severity for a in result.delivered] == [Severity.HIGH, Severity.LOW]
-
-
-def test_state_is_pruned_after_a_run(state):
-    cfg = only("dark_pool", min_pct_of_adv=0)
-    providers = StubProviders(uw=StubUW(prints=[make_trade(size=50_000, price=100.0)]))
-    engine.run(cfg, state, RecordingNotifier(), now=NOW, providers=providers)
-
-    stats = state.stats()
-    assert stats["seen"] == 1
-    assert stats["runs"] == 1
-
-    # A run far in the future clears the retention window.
-    later = NOW + timedelta(days=400)
-    engine.run(cfg, state, RecordingNotifier(), now=later, providers=providers, force=True)
-    assert state.stats()["seen"] <= 1
-
-
-# --------------------------------------------------------------------------
-# The CLI's `run` — what the cron actually invokes
-# --------------------------------------------------------------------------
-CLI_CONFIG = """
-tickers:
-  - NVDA
-  - AAPL
-detectors:
-  volume_anomaly:
-    enabled: true
-run:
-  attach_canslim: true
-"""
-
-
-def _cli_run(monkeypatch, tmp_path, overlay_body: str | None = None, *, extra=()):
-    """Invoke `monitor run --dry-run` and capture what it handed the engine."""
-    from monitor import cli
-
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(CLI_CONFIG)
-    overlay_path = tmp_path / "runtime.json"
-    if overlay_body is not None:
-        overlay_path.write_text(overlay_body)
-
-    captured: dict = {}
-
-    def fake_run(config, state, notifier, **kwargs):
-        captured["config"] = config
-        captured["kwargs"] = kwargs
-        return engine.RunResult(started_at=NOW)
-
-    monkeypatch.setattr(cli.engine, "run", fake_run)
-    code = cli.main(
-        [
-            "run",
-            "--dry-run",
-            "--config",
-            str(config_path),
-            "--overlay",
-            str(overlay_path),
-            *extra,
-        ]
-    )
-    assert code == 0
-    return captured
-
-
-def test_the_cron_run_picks_up_the_bots_edits(monkeypatch, tmp_path):
-    """Bot edits live in state/runtime.json — a run that ignores it ignores them.
-
-    This is the whole premise of the overlay: change something from Telegram and
-    the next tick honours it without a commit.
-    """
-    from monitor.runtime import Overlay
-
-    overlay = Overlay(path=tmp_path / "runtime.json")
-    overlay.add_ticker("PLTR")
-    overlay.remove_ticker("AAPL", baseline=["NVDA", "AAPL"])
-    overlay.set_detector("volume_anomaly", "rvol_threshold", "4.5")
-    overlay.set_canslim("narrator", "llm")
-    overlay.save()
-
-    captured = _cli_run(monkeypatch, tmp_path, overlay.path.read_text())
-    cfg = captured["config"]
-
-    assert cfg.tickers == ["NVDA", "PLTR"]
-    assert cfg.detector("volume_anomaly")["rvol_threshold"] == 4.5
-    assert cfg.canslim["narrator"] == "llm"
-
-
-def test_a_missing_overlay_is_not_an_error(monkeypatch, tmp_path):
-    """First run, or a lost Actions cache. The committed baseline is enough."""
-    cfg = _cli_run(monkeypatch, tmp_path)["config"]
-    assert cfg.tickers == ["NVDA", "AAPL"]
-
-
-def test_the_cron_run_attaches_scorecards(monkeypatch, tmp_path):
-    """`attach_canslim: true` has to reach the engine, or it silently does nothing."""
-    captured = _cli_run(monkeypatch, tmp_path)
-    assert captured["kwargs"]["canslim"] is not None
-
-
-def test_no_grade_overrides_the_config(monkeypatch, tmp_path):
-    captured = _cli_run(monkeypatch, tmp_path, extra=["--no-grade"])
-    assert captured["kwargs"]["canslim"] is None
-
-
-def test_attach_canslim_off_costs_nothing(monkeypatch, tmp_path):
-    from monitor import cli
-
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(CLI_CONFIG.replace("attach_canslim: true", "attach_canslim: false"))
-    captured: dict = {}
-    monkeypatch.setattr(
-        cli.engine,
-        "run",
-        lambda config, state, notifier, **kwargs: (
-            captured.update(kwargs) or engine.RunResult(started_at=NOW)
-        ),
-    )
-    code = cli.main(
-        [
-            "run",
-            "--dry-run",
-            "--config",
-            str(config_path),
-            "--overlay",
-            str(tmp_path / "runtime.json"),
-        ]
-    )
-    assert code == 0
-    assert captured["canslim"] is None
+        return self._chain
+
+
+class FakeInsider:
+    name = "fake-insider"
+
+    def __init__(self, filings=None, error=None):
+        self._filings = filings or []
+        self._error = error
+
+    def filings(self, ticker, since):
+        if self._error:
+            raise self._error
+        return self._filings
+
+
+def hot_bars():
+    bars = make_bars(sessions=8, base_volume=1_000_000)
+    return spike(bars, at=max(b.ts for b in bars), volume=6_000_000, close=204.0)
+
+
+def engine(config, store, **sources):
+    config.values["watchlist"] = ["NVDA"]
+    config.values["canslim.enabled"] = False
+    return Engine(config, store, SourceSet(**sources), now=NOW)
+
+
+class TestBasicRun:
+    def test_a_quiet_market_produces_nothing_and_stays_healthy(self, config, store):
+        result = engine(config, store, bars=FakeBars(make_bars(sessions=8))).run()
+        assert result.alerts == [] and result.ok and result.scanned == 1
+
+    def test_a_volume_anomaly_reaches_the_result(self, config, store):
+        result = engine(config, store, bars=FakeBars(hot_bars())).run()
+        assert len(result.alerts) == 1
+        assert result.alerts[0].signal == "volume"
+
+    def test_every_watched_ticker_is_scanned(self, config, store):
+        config.values["watchlist"] = ["NVDA", "MSFT", "AAPL"]
+        result = Engine(config, store, SourceSet(bars=FakeBars(make_bars(sessions=8))),
+                        now=NOW).run()
+        assert result.scanned == 3
+
+    def test_an_explicit_ticker_list_overrides_the_watchlist(self, config, store):
+        result = engine(config, store, bars=FakeBars(hot_bars())).run(["TSLA"])
+        assert result.scanned == 1
+        assert result.alerts[0].ticker == "TSLA"
+
+
+class TestFailureIsolation:
+    def test_an_unreachable_source_becomes_a_visible_issue(self, config, store):
+        source = FakeBars(error=Unreachable("fake-bars", "connection refused", "NVDA"))
+        result = engine(config, store, bars=source).run()
+        assert not result.ok
+        assert result.health.issues[0].kind == "unreachable"
+
+    def test_one_broken_source_does_not_stop_the_others(self, config, store):
+        result = engine(
+            config, store,
+            bars=FakeBars(error=Unreachable("fake-bars", "down", "NVDA")),
+            insider=FakeInsider([make_filing()]),
+        ).run()
+        assert any(a.signal == "insider" for a in result.alerts)
+        assert not result.ok
+
+    def test_construction_issues_are_carried_into_the_result(self, config, store):
+        from monitor.models import SourceIssue
+        sources = SourceSet(bars=FakeBars(make_bars(sessions=8)))
+        sources.issues.append(SourceIssue("sec", "*", "unconfigured", "no user agent"))
+        result = Engine(config, store, sources, now=NOW).run()
+        assert any(i.source == "sec" for i in result.health.issues)
+
+    def test_a_signal_that_raises_is_contained(self, config, store, monkeypatch):
+        from monitor.signals import volume as volume_module
+
+        def explode(self, ctx):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(volume_module.VolumeSignal, "evaluate", explode)
+        result = engine(config, store,
+                        bars=FakeBars(hot_bars()),
+                        insider=FakeInsider([make_filing()])).run()
+        assert any(a.signal == "insider" for a in result.alerts)
+        assert any("volume" in note for note in result.health.notes)
+
+
+class TestOpenInterestCadence:
+    def _chain(self):
+        return make_chain(previous={"NVDA|2026-08-21|200|call": 34_051,
+                                    "NVDA|2026-08-21|195|put": 16_000})
+
+    def test_the_chain_is_fetched_once_a_day(self, config, store):
+        options = FakeOptions(self._chain())
+        made = engine(config, store, bars=FakeBars(make_bars(sessions=8)), options=options)
+        made.run()
+        made.run()
+        assert options.calls == 1
+
+    def test_a_new_day_fetches_again(self, config, store):
+        options = FakeOptions(self._chain())
+        config.values["watchlist"] = ["NVDA"]
+        config.values["canslim.enabled"] = False
+        sources = SourceSet(bars=FakeBars(make_bars(sessions=8)), options=options)
+        Engine(config, store, sources, now=NOW).run()
+        Engine(config, store, sources, now=NOW + timedelta(days=1)).run()
+        assert options.calls == 2
+
+    def test_a_first_snapshot_is_stored_and_noted_rather_than_alerted(self, config, store):
+        chain = make_chain(previous={})
+        result = engine(config, store, bars=FakeBars(make_bars(sessions=8)),
+                        options=FakeOptions(chain)).run()
+        assert not any(a.signal == "open_interest" for a in result.alerts)
+        assert any("first option snapshot" in n for n in result.health.notes)
+        assert store.oi_snapshot_dates("NVDA") == [chain.as_of]
+
+    def test_the_store_supplies_the_baseline_for_a_live_source(self, config, store):
+        store.save_oi_snapshot("NVDA", "2026-07-23", make_chain(
+            contracts=[(200.0, "call", 34_051), (195.0, "put", 16_000)]).contracts)
+        fresh = make_chain(previous={})
+        result = engine(config, store, bars=FakeBars(make_bars(sessions=8)),
+                        options=FakeOptions(fresh)).run()
+        assert any(a.signal == "open_interest" for a in result.alerts)
+
+    def test_a_stale_baseline_is_flagged_as_cumulative(self, config, store):
+        store.save_oi_snapshot("NVDA", "2026-07-01", make_chain(
+            contracts=[(200.0, "call", 34_051), (195.0, "put", 16_000)]).contracts)
+        result = engine(config, store, bars=FakeBars(make_bars(sessions=8)),
+                        options=FakeOptions(make_chain(previous={}))).run()
+        assert any("cumulative" in note for note in result.health.notes)
+
+    def test_a_failed_chain_fetch_does_not_burn_the_daily_marker(self, config, store):
+        options = FakeOptions(error=EmptyResponse("fake-options", "no contracts", "NVDA"))
+        made = engine(config, store, bars=FakeBars(make_bars(sessions=8)), options=options)
+        made.run()
+        made.run()
+        assert options.calls == 2, "a failure must be retried, not treated as done"
+
+
+class TestFiltering:
+    def test_an_already_sent_alert_is_dropped(self, config, store):
+        made = engine(config, store, bars=FakeBars(hot_bars()))
+        first = made.run()
+        for alert in first.alerts:
+            store.mark_sent(alert)
+        second = made.run()
+        assert second.alerts == [] and second.duplicates == 1
+
+    def test_alerts_below_the_minimum_severity_are_dropped(self, config, store):
+        config.values["notify.min_severity"] = "high"
+        config.values["signals.volume.combine"] = "any"
+        bars = spike(make_bars(sessions=8, base_volume=1_000_000),
+                     at=max(b.ts for b in make_bars(sessions=8)), volume=1_000_000, close=204.0)
+        result = engine(config, store, bars=FakeBars(bars)).run()
+        assert all(a.severity is Severity.HIGH for a in result.alerts)
+
+    def test_the_cap_keeps_the_most_severe_and_reports_the_rest(self, config, store):
+        config.values["notify.max_per_run"] = 2
+        config.values["watchlist"] = ["NVDA", "MSFT", "AAPL", "TSLA"]
+        config.values["canslim.enabled"] = False
+        sources = SourceSet(bars=FakeBars(hot_bars()))
+        result = Engine(config, store, sources, now=NOW).run()
+        assert len(result.alerts) == 2
+        assert result.capped == 2
+        assert result.generated == 4
+
+    def test_nothing_is_marked_sent_by_the_engine(self, config, store):
+        """Marking is the CLI's job, after delivery succeeds."""
+        result = engine(config, store, bars=FakeBars(hot_bars())).run()
+        assert result.alerts
+        assert not store.already_sent(result.alerts[0].dedup_key)
+
+
+class TestSessionAwareness:
+    def test_a_closed_market_is_noted_not_treated_as_a_fault(self, config, store):
+        config.values["watchlist"] = ["NVDA"]
+        config.values["canslim.enabled"] = False
+        sunday = datetime(2026, 7, 26, 12, 0, tzinfo=ET)
+        result = Engine(config, store, SourceSet(bars=FakeBars(make_bars(sessions=8))),
+                        now=sunday).run()
+        assert result.ok
+        assert any("not a trading day" in note for note in result.health.notes)
+
+    def test_all_signals_disabled_produces_a_note(self, config, store):
+        for name in ("volume", "blocks", "open_interest", "insider"):
+            config.values[f"signals.{name}.enabled"] = False
+        result = engine(config, store, bars=FakeBars(hot_bars())).run()
+        assert result.alerts == []
+        assert any("disabled" in note for note in result.health.notes)
+
+
+class TestCanSlimAttachment:
+    class FakeCanSlim:
+        enabled = True
+
+        def __init__(self, line="CAN SLIM B+ (72%) — WATCH"):
+            self._line = line
+            self.calls = []
+
+        def should_attach(self, rank):
+            return rank >= Severity.MEDIUM.rank
+
+        def line(self, ticker, fresh=False):
+            self.calls.append(ticker)
+            return self._line
+
+    def test_a_grade_is_attached_once_per_ticker(self, config, store):
+        config.values["watchlist"] = ["NVDA"]
+        grader = self.FakeCanSlim()
+        made = Engine(config, store, SourceSet(bars=FakeBars(hot_bars())),
+                      canslim=grader, now=NOW)
+        result = made.run()
+        assert result.canslim["NVDA"].startswith("CAN SLIM")
+        assert grader.calls == ["NVDA"]
+
+    def test_a_grading_failure_does_not_lose_the_alert(self, config, store):
+        class Broken(self.FakeCanSlim):
+            def line(self, ticker, fresh=False):
+                raise RuntimeError("fundamentals exploded")
+
+        config.values["watchlist"] = ["NVDA"]
+        result = Engine(config, store, SourceSet(bars=FakeBars(hot_bars())),
+                        canslim=Broken(), now=NOW).run()
+        assert result.alerts and result.canslim == {}

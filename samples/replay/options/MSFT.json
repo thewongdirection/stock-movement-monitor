@@ -1,0 +1,51 @@
+{
+ "ticker": "MSFT",
+ "snapshots": {
+  "2026-07-23": [
+   {
+    "expiry": "2026-09-18",
+    "strike": 390,
+    "right": "put",
+    "oi": 8200,
+    "volume": 0
+   },
+   {
+    "expiry": "2026-09-18",
+    "strike": 380,
+    "right": "put",
+    "oi": 6400,
+    "volume": 0
+   },
+   {
+    "expiry": "2026-09-18",
+    "strike": 400,
+    "right": "call",
+    "oi": 15100,
+    "volume": 0
+   }
+  ],
+  "2026-07-24": [
+   {
+    "expiry": "2026-09-18",
+    "strike": 390,
+    "right": "put",
+    "oi": 21400,
+    "volume": 0
+   },
+   {
+    "expiry": "2026-09-18",
+    "strike": 380,
+    "right": "put",
+    "oi": 14900,
+    "volume": 0
+   },
+   {
+    "expiry": "2026-09-18",
+    "strike": 400,
+    "right": "call",
+    "oi": 13050,
+    "volume": 0
+   }
+  ]
+ }
+}

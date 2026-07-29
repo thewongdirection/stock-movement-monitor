@@ -1,0 +1,93 @@
+{
+ "ticker": "NVDA",
+ "snapshots": {
+  "2026-07-23": [
+   {
+    "expiry": "2026-08-21",
+    "strike": 200,
+    "right": "call",
+    "oi": 34051,
+    "volume": 10487
+   },
+   {
+    "expiry": "2026-08-21",
+    "strike": 205,
+    "right": "call",
+    "oi": 21000,
+    "volume": 6100
+   },
+   {
+    "expiry": "2026-08-21",
+    "strike": 210,
+    "right": "call",
+    "oi": 18400,
+    "volume": 4800
+   },
+   {
+    "expiry": "2026-08-21",
+    "strike": 195,
+    "right": "put",
+    "oi": 18000,
+    "volume": 5200
+   },
+   {
+    "expiry": "2026-08-21",
+    "strike": 200,
+    "right": "put",
+    "oi": 12500,
+    "volume": 3900
+   },
+   {
+    "expiry": "2026-08-21",
+    "strike": 190,
+    "right": "put",
+    "oi": 9100,
+    "volume": 2200
+   }
+  ],
+  "2026-07-24": [
+   {
+    "expiry": "2026-08-21",
+    "strike": 200,
+    "right": "call",
+    "oi": 52400,
+    "volume": 31200
+   },
+   {
+    "expiry": "2026-08-21",
+    "strike": 205,
+    "right": "call",
+    "oi": 29800,
+    "volume": 12400
+   },
+   {
+    "expiry": "2026-08-21",
+    "strike": 210,
+    "right": "call",
+    "oi": 18650,
+    "volume": 900
+   },
+   {
+    "expiry": "2026-08-21",
+    "strike": 195,
+    "right": "put",
+    "oi": 16200,
+    "volume": 4100
+   },
+   {
+    "expiry": "2026-08-21",
+    "strike": 200,
+    "right": "put",
+    "oi": 12610,
+    "volume": 1200
+   },
+   {
+    "expiry": "2026-08-21",
+    "strike": 190,
+    "right": "put",
+    "oi": 9050,
+    "volume": 300
+   }
+  ]
+ }
+}

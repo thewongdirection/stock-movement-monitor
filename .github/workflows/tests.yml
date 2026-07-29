@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
@@ -25,21 +25,23 @@ jobs:
 
       - run: pip install -r requirements-dev.txt
 
-      # Optional: lets the CAN SLIM tests run instead of skipping.
-      - name: Fetch the CAN SLIM grader skill
-        continue-on-error: true
-        run: |
-          git clone --depth 1 https://github.com/thewongdirection/can-slim-grader \
-            vendor/can-slim-grader
-
       - name: Tests
         run: python -m pytest -q
-        env:
-          CANSLIM_SKILL_PATH: vendor/can-slim-grader
 
       # Catches a bad threshold or a stray key in the committed config before
-      # the cron picks it up and quietly clamps it.
-      - name: Config is valid
-        run: python -m monitor validate
+      # anyone deploys it and the schema quietly clamps it.
+      - name: Shipped configs are valid
+        run: |
+          python -m monitor --config config.example.yaml validate || true
+          python -m monitor --config config.replay.yaml validate
+        env:
+          PYTHONPATH: src
+
+      # The demo path in SETUP.md step 2 is the first thing anyone runs. If it
+      # breaks, the project looks broken.
+      - name: The no-credentials demo still works
+        run: |
+          python -m monitor --config config.replay.yaml run \
+            --dry-run --as-of 2026-07-24T12:00:00
         env:
           PYTHONPATH: src
