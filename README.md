@@ -234,4 +234,13 @@ pip install -r requirements-dev.txt
 PYTHONPATH=src python -m pytest -q
 ```
 
-441 tests, no network access required.
+441 tests, no network access required — every source is stubbed or replayed, so
+the suite runs the same on a plane as it does on a server.
+
+**There is no CI.** This repository deliberately has no GitHub Actions: the
+monitor runs on your own box under systemd, and nothing here needs a build.
+That makes the command above the only gate, so run it before you deploy —
+`deploy/install.sh` will happily install a broken tree.
+
+If you want CI back, it is one file: a workflow that installs
+`requirements-dev.txt` and runs `python -m pytest -q` with `PYTHONPATH=src`.

@@ -323,7 +323,16 @@ it happened — but **refused** when typed into the bot.
 
 ## 9. Install it as a service
 
-On the machine that will run it:
+**First, run the tests.** There is no CI on this repository — the monitor runs
+on your box, not on GitHub — so this is the only thing standing between a broken
+tree and a deployed one:
+
+```bash
+pip install -r requirements-dev.txt
+PYTHONPATH=src python -m pytest -q
+```
+
+Then, on the machine that will run it:
 
 ```bash
 sudo ./deploy/install.sh
