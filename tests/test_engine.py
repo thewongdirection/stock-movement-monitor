@@ -179,6 +179,34 @@ class TestOpenInterestCadence:
         made.run()
         assert options.calls == 2, "a failure must be retried, not treated as done"
 
+    def test_a_dry_run_does_not_burn_the_daily_marker(self, config, store):
+        """A preview must not cost the real run its headline signal.
+
+        Setting the once-a-day marker during --dry-run made the next real run
+        skip the chain and never alert on open interest — for the whole day, on
+        exactly the path SETUP walks you through first.
+        """
+        options = FakeOptions(self._chain())
+        config.values["watchlist"] = ["NVDA"]
+        config.values["canslim.enabled"] = False
+        sources = SourceSet(bars=FakeBars(make_bars(sessions=8)), options=options)
+
+        preview = Engine(config, store, sources, now=NOW, dry_run=True).run()
+        assert any(a.signal == "open_interest" for a in preview.alerts)
+
+        real = Engine(config, store, sources, now=NOW).run()
+        assert any(a.signal == "open_interest" for a in real.alerts), \
+            "the real run lost the OI alert because the dry run consumed the marker"
+        assert options.calls == 2
+
+    def test_a_dry_run_still_stores_the_snapshot_for_tomorrow(self, config, store):
+        options = FakeOptions(self._chain())
+        config.values["watchlist"] = ["NVDA"]
+        config.values["canslim.enabled"] = False
+        Engine(config, store, SourceSet(bars=FakeBars(make_bars(sessions=8)), options=options),
+               now=NOW, dry_run=True).run()
+        assert store.oi_snapshot_dates("NVDA"), "the snapshot is real data; keep it"
+
 
 class TestFiltering:
     def test_an_already_sent_alert_is_dropped(self, config, store):

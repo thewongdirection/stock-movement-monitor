@@ -105,7 +105,7 @@ def cmd_run(args) -> int:
             engine = Engine(
                 config, store, sources,
                 canslim=CanSlim(config, store, fmp=sources.fundamentals),
-                now=as_of,
+                now=as_of, dry_run=args.dry_run,
             )
             result = engine.run(args.ticker)
 
@@ -116,7 +116,8 @@ def cmd_run(args) -> int:
         store.finish_run(
             run_id, scanned=result.scanned, alerts=delivered,
             issues=len(result.health.issues), ok=result.health.ok,
-            note=result.health.summary(),
+            # Labelled, so a preview in /status is not mistaken for a delivery.
+            note=("dry run — " if args.dry_run else "") + result.health.summary(),
         )
 
         print(

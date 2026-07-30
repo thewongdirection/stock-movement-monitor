@@ -48,12 +48,15 @@ class RunResult:
 
 class Engine:
     def __init__(self, config: Config, store: Store, sources: SourceSet,
-                 canslim: CanSlim | None = None, now: datetime | None = None):
+                 canslim: CanSlim | None = None, now: datetime | None = None,
+                 dry_run: bool = False):
         self.config = config
         self.store = store
         self.sources = sources
         self.canslim = canslim
         self.now = to_et(now) if now else now_et()
+        #: A preview must not consume anything a real run needs. See _load_chain.
+        self.dry_run = dry_run
 
     # -- the pass -----------------------------------------------------------
     def run(self, tickers: list[str] | None = None) -> RunResult:
@@ -177,8 +180,18 @@ class Engine:
             )
 
         ctx.chain = chain
+
+        # The snapshot is real observed data and re-saving it is an upsert, so it
+        # is stored either way — tomorrow's diff needs it.
         self.store.save_oi_snapshot(ctx.ticker, chain.as_of, chain.contracts)
-        self.store.set_watermark(marker, today)
+
+        # The daily marker is different: it is a budget, and a preview must not
+        # spend it. Setting it here on a --dry-run made the real scheduled run
+        # later the same day skip the chain entirely and never alert on open
+        # interest — losing the headline signal for the whole day, on precisely
+        # the path the setup guide walks you through first.
+        if not self.dry_run:
+            self.store.set_watermark(marker, today)
 
     # -- filtering ----------------------------------------------------------
     def _filter(self, alerts: list[Alert], result: RunResult) -> list[Alert]:
